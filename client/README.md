@@ -2,6 +2,84 @@
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
+# Doctor Appointment Portal - Frontend Structure
+
+```
+src/
+├── assets/                  # Static assets
+│   ├── images/
+│   └── icons/
+├── components/              # Reusable UI components
+│   ├── ui/                  # shadcn/ui components
+│   ├── common/              # Shared components
+│   │   ├── Header/
+│   │   ├── Footer/
+│   │   ├── Sidebar/
+│   │   ├── Breadcrumbs/
+│   │   └── Notifications/
+│   ├── layouts/             # Layout components
+│   │   ├── DashboardLayout/
+│   │   ├── AuthLayout/
+│   │   └── MainLayout/
+│   └── features/            # Feature-specific components
+│       ├── auth/
+│       ├── appointments/
+│       ├── doctors/
+│       ├── patients/
+│       ├── consultations/
+│       ├── payments/
+│       └── prescriptions/
+├── hooks/                   # Custom React hooks
+│   ├── useAuth.ts
+│   ├── useToast.ts
+│   ├── useAppointments.ts
+│   └── useFetch.ts
+├── lib/                     # Utility functions
+│   ├── api.ts
+│   ├── utils.ts
+│   ├── constants.ts
+│   ├── validation.ts
+│   └── date-utils.ts
+├── pages/                   # Page components
+│   ├── auth/
+│   │   ├── LoginPage.tsx
+│   │   ├── RegisterPage.tsx
+│   │   └── ForgotPasswordPage.tsx
+│   ├── dashboard/
+│   │   ├── patient/
+│   │   ├── doctor/
+│   │   └── admin/
+│   ├── appointments/
+│   ├── doctors/
+│   ├── clinics/
+│   ├── consultations/
+│   └── settings/
+├── providers/               # Context providers
+│   ├── AuthProvider.tsx
+│   ├── ThemeProvider.tsx
+│   └── NotificationProvider.tsx
+├── services/                # API services
+│   ├── authService.ts
+│   ├── appointmentService.ts
+│   ├── doctorService.ts
+│   └── paymentService.ts
+├── stores/                  # State management
+│   ├── authStore.ts
+│   └── uiStore.ts
+├── types/                   # TypeScript types
+│   ├── auth.types.ts
+│   ├── appointment.types.ts
+│   ├── doctor.types.ts
+│   └── api.types.ts
+├── routes/                  # Route definitions
+│   ├── index.tsx
+│   ├── privateRoutes.tsx
+│   └── publicRoutes.tsx
+├── App.tsx
+├── main.tsx
+└── index.css
+```
+
 Currently, two official plugins are available:
 
 - [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react/README.md) uses [Babel](https://babeljs.io/) for Fast Refresh
@@ -28,15 +106,15 @@ export default tseslint.config({
       tsconfigRootDir: import.meta.dirname,
     },
   },
-})
+});
 ```
 
 You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
 
 ```js
 // eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+import reactX from 'eslint-plugin-react-x';
+import reactDom from 'eslint-plugin-react-dom';
 
 export default tseslint.config({
   plugins: {
@@ -50,5 +128,5 @@ export default tseslint.config({
     ...reactX.configs['recommended-typescript'].rules,
     ...reactDom.configs.recommended.rules,
   },
-})
+});
 ```
