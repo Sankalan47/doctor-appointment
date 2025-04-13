@@ -1,0 +1,24 @@
+{
+  "name": "doctor-appointment-portal",
+  "version": "1.0.0",
+  "description": "Doctor Appointment Portal with in-clinic, video, and home visit capabilities",
+  "private": true,
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "docker-compose up",
+    "build": "docker-compose -f docker-compose.prod.yml build",
+    "start": "docker-compose -f docker-compose.prod.yml up -d",
+    "client": "yarn workspace client start",
+    "server": "yarn workspace server dev",
+    "lint": "yarn workspaces run lint",
+    "test": "yarn workspaces run test",
+    "prepare": "husky install"
+  },
+  "devDependencies": {
+    "husky": "^8.0.3",
+    "lint-staged": "^13.2.2"
+  }
+}

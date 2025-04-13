@@ -1,0 +1,3230 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+<additional_info>
+
+</additional_info>
+
+</file_summary>
+
+<directory_structure>
+src/
+  api/
+    controllers/
+      appointment.controller.ts
+      auth.controller.ts
+      doctor.controller.ts
+  config/
+    index.ts
+  database/
+    models/
+      Appointment.ts
+      Clinic.ts
+      Consultation.ts
+      Doctor.ts
+      DoctorClinic.ts
+      DoctorClinicSchedule.ts
+      DoctorSpecialization.ts
+      HomeVisit.ts
+      Patient.ts
+      Payment.ts
+      Prescription.ts
+      PrescriptionMedication.ts
+      Rating.ts
+      Specialization.ts
+      User.ts
+    index.ts
+  middleware/
+    auth.middleware.ts
+    error.middleware.ts
+  routes/
+    index.ts
+  services/
+    socket.service.ts
+  types/
+    environment.d.ts
+    index.ts
+  utils/
+    logger.ts
+  app.ts
+  index.ts
+jest.config.ts
+package.json
+tsconfig.json
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="src/api/controllers/appointment.controller.ts">
+// server/src/api/controllers/appointment.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import { Op } from 'sequelize';
+import Appointment, { AppointmentStatus, AppointmentType } from '../../database/models/Appointment';
+import Doctor from '../../database/models/Doctor';
+import Patient from '../../database/models/Patient';
+import User from '../../database/models/User';
+import Clinic from '../../database/models/Clinic';
+import Consultation from '../../database/models/Consultation';
+import HomeVisit from '../../database/models/HomeVisit';
+import { AuthRequest } from '../../middleware/auth.middleware';
+import { PaginatedResponse } from '../../types';
+import { getSocketIO } from '../../services/socket.service';
+
+/**
+ * Create a new appointment
+ * @route POST /api/v1/appointments
+ * @access Private
+ */
+export const createAppointment = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const {
+      doctorId,
+      clinicId,
+      type,
+      scheduledStartTime,
+      scheduledEndTime,
+      reason,
+      symptoms,
+      address,
+    } = req.body;
+
+    // Get patient ID based on authenticated user
+    const patient = await Patient.findOne({ where: { userId: req.user.id } });
+    if (!patient) {
+      res.status(404);
+      throw new Error('Patient profile not found');
+    }
+
+    // Verify doctor exists
+    const doctor = await Doctor.findByPk(doctorId);
+    if (!doctor) {
+      res.status(404);
+      throw new Error('Doctor not found');
+    }
+
+    // For in-clinic appointments, verify clinic exists
+    if (type === AppointmentType.IN_CLINIC && clinicId) {
+      const clinic = await Clinic.findByPk(clinicId);
+      if (!clinic) {
+        res.status(404);
+        throw new Error('Clinic not found');
+      }
+    }
+
+    // Create appointment
+    const appointment = await Appointment.create({
+      id: uuidv4(),
+      patientId: patient.id,
+      doctorId,
+      clinicId: type === AppointmentType.IN_CLINIC ? clinicId : null,
+      type,
+      status: AppointmentStatus.PENDING,
+      scheduledStartTime,
+      scheduledEndTime,
+      reason,
+      symptoms,
+      fee: type === AppointmentType.HOME_VISIT ? doctor.homeVisitFee : doctor.consultationFee,
+      isPaid: false,
+      isRescheduled: false,
+    });
+
+    // Create associated records based on appointment type
+    if (type === AppointmentType.TELE_CONSULTATION) {
+      await Consultation.create({
+        id: uuidv4(),
+        appointmentId: appointment.id,
+        status: 'scheduled',
+      });
+    } else if (type === AppointmentType.HOME_VISIT) {
+      if (!address) {
+        res.status(400);
+        throw new Error('Address is required for home visits');
+      }
+
+      await HomeVisit.create({
+        id: uuidv4(),
+        appointmentId: appointment.id,
+        status: 'scheduled',
+        address,
+      });
+    }
+
+    // Notify doctor about new appointment
+    const io = getSocketIO();
+    io.to(`doctor-${doctorId}`).emit('new-appointment', {
+      id: appointment.id,
+      type: appointment.type,
+      scheduledStartTime: appointment.scheduledStartTime,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Appointment created successfully',
+      data: {
+        id: appointment.id,
+        type: appointment.type,
+        status: appointment.status,
+        scheduledStartTime: appointment.scheduledStartTime,
+        scheduledEndTime: appointment.scheduledEndTime,
+        fee: appointment.fee,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get user appointments
+ * @route GET /api/v1/appointments
+ * @access Private
+ */
+export const getUserAppointments = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const offset = (page - 1) * limit;
+    const status = req.query.status as string;
+    const from = req.query.from as string;
+    const to = req.query.to as string;
+
+    // Determine if user is patient or doctor
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    let where: any = {};
+
+    if (user.role === 'patient') {
+      const patient = await Patient.findOne({ where: { userId: user.id } });
+      if (!patient) {
+        res.status(404);
+        throw new Error('Patient profile not found');
+      }
+      where.patientId = patient.id;
+    } else if (user.role === 'doctor') {
+      const doctor = await Doctor.findOne({ where: { userId: user.id } });
+      if (!doctor) {
+        res.status(404);
+        throw new Error('Doctor profile not found');
+      }
+      where.doctorId = doctor.id;
+    } else {
+      res.status(403);
+      throw new Error('Unauthorized');
+    }
+
+    // Filter by status
+    if (status) {
+      where.status = status;
+    }
+
+    // Filter by date range
+    if (from && to) {
+      where.scheduledStartTime = {
+        [Op.between]: [new Date(from), new Date(to)],
+      };
+    } else if (from) {
+      where.scheduledStartTime = {
+        [Op.gte]: new Date(from),
+      };
+    } else if (to) {
+      where.scheduledStartTime = {
+        [Op.lte]: new Date(to),
+      };
+    }
+
+    // Get appointments
+    const { count, rows } = await Appointment.findAndCountAll({
+      where,
+      include: [
+        {
+          model: Doctor,
+          include: [
+            {
+              model: User,
+              attributes: ['firstName', 'lastName', 'profileImage'],
+            },
+          ],
+        },
+        {
+          model: Patient,
+          include: [
+            {
+              model: User,
+              attributes: ['firstName', 'lastName', 'profileImage'],
+            },
+          ],
+        },
+        {
+          model: Clinic,
+          attributes: ['id', 'name', 'address'],
+        },
+        {
+          model: Consultation,
+        },
+        {
+          model: HomeVisit,
+        },
+      ],
+      order: [['scheduledStartTime', 'DESC']],
+      limit,
+      offset,
+    });
+
+    // Format appointments
+    const appointments = rows.map(appointment => ({
+      id: appointment.id,
+      type: appointment.type,
+      status: appointment.status,
+      scheduledStartTime: appointment.scheduledStartTime,
+      scheduledEndTime: appointment.scheduledEndTime,
+      reason: appointment.reason,
+      symptoms: appointment.symptoms,
+      fee: appointment.fee,
+      isPaid: appointment.isPaid,
+      doctor: {
+        id: appointment.doctor.id,
+        firstName: appointment.doctor.user.firstName,
+        lastName: appointment.doctor.user.lastName,
+        profileImage: appointment.doctor.user.profileImage,
+      },
+      patient: {
+        id: appointment.patient.id,
+        firstName: appointment.patient.user.firstName,
+        lastName: appointment.patient.user.lastName,
+        profileImage: appointment.patient.user.profileImage,
+      },
+      clinic: appointment.clinic
+        ? {
+            id: appointment.clinic.id,
+            name: appointment.clinic.name,
+            address: appointment.clinic.address,
+          }
+        : null,
+      consultation: appointment.consultation
+        ? {
+            id: appointment.consultation.id,
+            status: appointment.consultation.status,
+            sessionId: appointment.consultation.sessionId,
+          }
+        : null,
+      homeVisit: appointment.homeVisit
+        ? {
+            id: appointment.homeVisit.id,
+            status: appointment.homeVisit.status,
+            address: appointment.homeVisit.address,
+            estimatedArrivalTime: appointment.homeVisit.estimatedArrivalTime,
+          }
+        : null,
+      createdAt: appointment.createdAt,
+      updatedAt: appointment.updatedAt,
+    }));
+
+    const response: PaginatedResponse<(typeof appointments)[0]> = {
+      data: appointments,
+      pagination: {
+        page,
+        limit,
+        totalItems: count,
+        totalPages: Math.ceil(count / limit),
+      },
+    };
+
+    res.status(200).json({
+      success: true,
+      ...response,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get appointment by ID
+ * @route GET /api/v1/appointments/:id
+ * @access Private
+ */
+export const getAppointmentById = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+
+    const appointment = await Appointment.findByPk(id, {
+      include: [
+        {
+          model: Doctor,
+          include: [
+            {
+              model: User,
+              attributes: ['firstName', 'lastName', 'profileImage'],
+            },
+          ],
+        },
+        {
+          model: Patient,
+          include: [
+            {
+              model: User,
+              attributes: ['firstName', 'lastName', 'profileImage'],
+            },
+          ],
+        },
+        {
+          model: Clinic,
+          attributes: ['id', 'name', 'address', 'phone'],
+        },
+        {
+          model: Consultation,
+        },
+        {
+          model: HomeVisit,
+        },
+      ],
+    });
+
+    if (!appointment) {
+      res.status(404);
+      throw new Error('Appointment not found');
+    }
+
+    // Verify user has access to this appointment
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    if (user.role === 'patient') {
+      const patient = await Patient.findOne({ where: { userId: user.id } });
+      if (!patient || patient.id !== appointment.patientId) {
+        res.status(403);
+        throw new Error('Unauthorized');
+      }
+    } else if (user.role === 'doctor') {
+      const doctor = await Doctor.findOne({ where: { userId: user.id } });
+      if (!doctor || doctor.id !== appointment.doctorId) {
+        res.status(403);
+        throw new Error('Unauthorized');
+      }
+    } else if (user.role !== 'admin') {
+      res.status(403);
+      throw new Error('Unauthorized');
+    }
+
+    // Format appointment
+    const formattedAppointment = {
+      id: appointment.id,
+      type: appointment.type,
+      status: appointment.status,
+      scheduledStartTime: appointment.scheduledStartTime,
+      scheduledEndTime: appointment.scheduledEndTime,
+      actualStartTime: appointment.actualStartTime,
+      actualEndTime: appointment.actualEndTime,
+      reason: appointment.reason,
+      symptoms: appointment.symptoms,
+      notes: appointment.notes,
+      fee: appointment.fee,
+      isPaid: appointment.isPaid,
+      doctor: {
+        id: appointment.doctor.id,
+        firstName: appointment.doctor.user.firstName,
+        lastName: appointment.doctor.user.lastName,
+        profileImage: appointment.doctor.user.profileImage,
+      },
+      patient: {
+        id: appointment.patient.id,
+        firstName: appointment.patient.user.firstName,
+        lastName: appointment.patient.user.lastName,
+        profileImage: appointment.patient.user.profileImage,
+      },
+      clinic: appointment.clinic
+        ? {
+            id: appointment.clinic.id,
+            name: appointment.clinic.name,
+            address: appointment.clinic.address,
+            phone: appointment.clinic.phone,
+          }
+        : null,
+      consultation: appointment.consultation
+        ? {
+            id: appointment.consultation.id,
+            status: appointment.consultation.status,
+            sessionId: appointment.consultation.sessionId,
+            sessionToken: appointment.consultation.sessionToken,
+            startTime: appointment.consultation.startTime,
+            endTime: appointment.consultation.endTime,
+            duration: appointment.consultation.duration,
+            doctorNotes: appointment.consultation.doctorNotes,
+          }
+        : null,
+      homeVisit: appointment.homeVisit
+        ? {
+            id: appointment.homeVisit.id,
+            status: appointment.homeVisit.status,
+            address: appointment.homeVisit.address,
+            estimatedArrivalTime: appointment.homeVisit.estimatedArrivalTime,
+            actualArrivalTime: appointment.homeVisit.actualArrivalTime,
+            visitStartTime: appointment.homeVisit.visitStartTime,
+            visitEndTime: appointment.homeVisit.visitEndTime,
+            doctorNotes: appointment.homeVisit.doctorNotes,
+          }
+        : null,
+      createdAt: appointment.createdAt,
+      updatedAt: appointment.updatedAt,
+    };
+
+    res.status(200).json({
+      success: true,
+      data: formattedAppointment,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Update appointment status
+ * @route PUT /api/v1/appointments/:id/status
+ * @access Private
+ */
+export const updateAppointmentStatus = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+    const { status, notes } = req.body;
+
+    const appointment = await Appointment.findByPk(id);
+    if (!appointment) {
+      res.status(404);
+      throw new Error('Appointment not found');
+    }
+
+    // Verify user has permission to update
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    if (user.role === 'doctor') {
+      const doctor = await Doctor.findOne({ where: { userId: user.id } });
+      if (!doctor || doctor.id !== appointment.doctorId) {
+        res.status(403);
+        throw new Error('Unauthorized');
+      }
+    } else if (user.role === 'patient') {
+      const patient = await Patient.findOne({ where: { userId: user.id } });
+      if (!patient || patient.id !== appointment.patientId) {
+        res.status(403);
+        throw new Error('Unauthorized');
+      }
+
+      // Patients can only cancel their appointments
+      if (status !== AppointmentStatus.CANCELLED) {
+        res.status(403);
+        throw new Error('Patients can only cancel appointments');
+      }
+    } else if (user.role !== 'admin') {
+      res.status(403);
+      throw new Error('Unauthorized');
+    }
+
+    // Update appointment status
+    appointment.status = status;
+    if (notes) {
+      appointment.notes = notes;
+    }
+
+    // Update associated records based on appointment type
+    if (appointment.type === AppointmentType.TELE_CONSULTATION) {
+      const consultation = await Consultation.findOne({ where: { appointmentId: appointment.id } });
+      if (consultation) {
+        let consultationStatus;
+        switch (status) {
+          case AppointmentStatus.CONFIRMED:
+            consultationStatus = 'scheduled';
+            break;
+          case AppointmentStatus.IN_PROGRESS:
+            consultationStatus = 'in_progress';
+            appointment.actualStartTime = new Date();
+            break;
+          case AppointmentStatus.COMPLETED:
+            consultationStatus = 'completed';
+            appointment.actualEndTime = new Date();
+            break;
+          case AppointmentStatus.CANCELLED:
+            consultationStatus = 'cancelled';
+            break;
+          case AppointmentStatus.NO_SHOW:
+            consultationStatus = 'missed';
+            break;
+          default:
+            consultationStatus = consultation.status;
+        }
+        await consultation.update({ status: consultationStatus });
+      }
+    } else if (appointment.type === AppointmentType.HOME_VISIT) {
+      const homeVisit = await HomeVisit.findOne({ where: { appointmentId: appointment.id } });
+      if (homeVisit) {
+        let homeVisitStatus;
+        switch (status) {
+          case AppointmentStatus.CONFIRMED:
+            homeVisitStatus = 'scheduled';
+            break;
+          case AppointmentStatus.IN_PROGRESS:
+            homeVisitStatus = 'in_progress';
+            appointment.actualStartTime = new Date();
+            break;
+          case AppointmentStatus.COMPLETED:
+            homeVisitStatus = 'completed';
+            appointment.actualEndTime = new Date();
+            break;
+          case AppointmentStatus.CANCELLED:
+            homeVisitStatus = 'cancelled';
+            break;
+          default:
+            homeVisitStatus = homeVisit.status;
+        }
+        await homeVisit.update({ status: homeVisitStatus });
+      }
+    }
+
+    await appointment.save();
+
+    // Notify the other party
+    const io = getSocketIO();
+    if (user.role === 'doctor') {
+      io.to(`patient-${appointment.patientId}`).emit('appointment-updated', {
+        id: appointment.id,
+        status: appointment.status,
+      });
+    } else {
+      io.to(`doctor-${appointment.doctorId}`).emit('appointment-updated', {
+        id: appointment.id,
+        status: appointment.status,
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Appointment status updated successfully',
+      data: {
+        id: appointment.id,
+        status: appointment.status,
+        updatedAt: appointment.updatedAt,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+</file>
+
+<file path="src/api/controllers/auth.controller.ts">
+// server/src/api/controllers/auth.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { validationResult } from 'express-validator';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
+import { v4 as uuidv4 } from 'uuid';
+import User, { UserRole } from '../../database/models/User';
+import Patient from '../../database/models/Patient';
+import Doctor from '../../database/models/Doctor';
+import config from '../../config';
+import { TokenResponse } from '../../types';
+import logger from '../../utils/logger';
+import { AuthRequest } from '../../middleware/auth.middleware';
+
+/**
+ * Register a new user
+ * @route POST /api/v1/auth/register
+ * @access Public
+ */
+export const register = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    // Validate request
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      res.status(400);
+      throw new Error('Validation failed');
+    }
+
+    const { firstName, lastName, email, password, phone, role } = req.body;
+
+    // Check if user already exists
+    const existingUser = await User.findOne({ where: { email } });
+    if (existingUser) {
+      res.status(400);
+      throw new Error('User already exists');
+    }
+
+    // Create user
+    const user = await User.create({
+      id: uuidv4(),
+      firstName,
+      lastName,
+      email,
+      password,
+      phone,
+      role: role || UserRole.PATIENT,
+      isEmailVerified: false,
+      isPhoneVerified: false,
+      isActive: true,
+    });
+
+    // Create patient or doctor record based on role
+    if (user.role === UserRole.PATIENT) {
+      await Patient.create({
+        id: uuidv4(),
+        userId: user.id,
+      });
+    } else if (user.role === UserRole.DOCTOR) {
+      await Doctor.create({
+        id: uuidv4(),
+        userId: user.id,
+        licenseNumber: req.body.licenseNumber || '',
+        consultationFee: 0,
+        offersHomeVisit: false,
+        offersTeleConsultation: true,
+        status: 'pending',
+        education: [],
+        experience: [],
+      });
+    }
+
+    // Generate tokens
+    const tokens = generateTokens(user);
+
+    // Save refresh token to user
+    user.refreshToken = tokens.refreshToken;
+    await user.save();
+
+    res.status(201).json({
+      success: true,
+      message: 'User registered successfully',
+      user: {
+        id: user.id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        phone: user.phone,
+        role: user.role,
+      },
+      ...tokens,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Login user
+ * @route POST /api/v1/auth/login
+ * @access Public
+ */
+export const login = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    // Validate request
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      res.status(400);
+      throw new Error('Validation failed');
+    }
+
+    const { email, password } = req.body;
+
+    // Find user
+    const user = await User.findOne({ where: { email } });
+    if (!user) {
+      res.status(401);
+      throw new Error('Invalid credentials');
+    }
+
+    // Check if user is active
+    if (!user.isActive) {
+      res.status(401);
+      throw new Error('Account is disabled');
+    }
+
+    // Check password
+    const isMatch = await user.comparePassword(password);
+    if (!isMatch) {
+      res.status(401);
+      throw new Error('Invalid credentials');
+    }
+
+    // Generate tokens
+    const tokens = generateTokens(user);
+
+    // Save refresh token to user
+    user.refreshToken = tokens.refreshToken;
+    user.lastLogin = new Date();
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Login successful',
+      user: {
+        id: user.id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        phone: user.phone,
+        role: user.role,
+        profileImage: user.profileImage,
+      },
+      ...tokens,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get current user
+ * @route GET /api/v1/auth/me
+ * @access Private
+ */
+export const getCurrentUser = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    res.status(200).json({
+      success: true,
+      user: {
+        id: user.id,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        email: user.email,
+        phone: user.phone,
+        role: user.role,
+        profileImage: user.profileImage,
+        isEmailVerified: user.isEmailVerified,
+        isPhoneVerified: user.isPhoneVerified,
+        lastLogin: user.lastLogin,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Refresh token
+ * @route POST /api/v1/auth/refresh-token
+ * @access Public
+ */
+export const refreshToken = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { refreshToken } = req.body;
+
+    if (!refreshToken) {
+      res.status(401);
+      throw new Error('Refresh token is required');
+    }
+
+    // Find user with this refresh token
+    const user = await User.findOne({ where: { refreshToken } });
+    if (!user) {
+      res.status(401);
+      throw new Error('Invalid refresh token');
+    }
+
+    // Verify refresh token
+    try {
+      jwt.verify(refreshToken, config.jwt.secret);
+    } catch (error) {
+      res.status(401);
+      throw new Error('Invalid refresh token');
+    }
+
+    // Generate new tokens
+    const tokens = generateTokens(user);
+
+    // Save new refresh token
+    user.refreshToken = tokens.refreshToken;
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Token refreshed successfully',
+      ...tokens,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Logout user
+ * @route POST /api/v1/auth/logout
+ * @access Private
+ */
+export const logout = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    // Find user
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    // Clear refresh token
+    user.refreshToken = null;
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Logout successful',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Request password reset
+ * @route POST /api/v1/auth/forgot-password
+ * @access Public
+ */
+export const forgotPassword = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { email } = req.body;
+
+    // Find user
+    const user = await User.findOne({ where: { email } });
+    if (!user) {
+      // Don't reveal that user doesn't exist
+      res.status(200).json({
+        success: true,
+        message: 'If your email is registered, you will receive a password reset link',
+      });
+      return;
+    }
+
+    // Generate reset token (would normally send an email here)
+    const resetToken = jwt.sign({ id: user.id }, config.jwt.secret, { expiresIn: '1h' });
+
+    // In a real implementation, send email with resetToken
+    logger.info(`Reset token for ${email}: ${resetToken}`);
+
+    res.status(200).json({
+      success: true,
+      message: 'If your email is registered, you will receive a password reset link',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Reset password
+ * @route POST /api/v1/auth/reset-password
+ * @access Public
+ */
+export const resetPassword = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { token, password } = req.body;
+
+    // Verify token
+    let decoded;
+    try {
+      decoded = jwt.verify(token, config.jwt.secret) as { id: string };
+    } catch (error) {
+      res.status(400);
+      throw new Error('Invalid or expired token');
+    }
+
+    // Find user
+    const user = await User.findByPk(decoded.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    // Update password
+    user.password = password;
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Password reset successful',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Generate JWT tokens
+ */
+const generateTokens = (user: User): TokenResponse => {
+  const accessToken = jwt.sign(
+    { id: user.id, email: user.email, role: user.role },
+    config.jwt.secret,
+    { expiresIn: config.jwt.accessExpiresIn }
+  );
+
+  const refreshToken = jwt.sign({ id: user.id }, config.jwt.secret, {
+    expiresIn: config.jwt.refreshExpiresIn,
+  });
+
+  return {
+    accessToken,
+    refreshToken,
+    expiresIn: parseInt(config.jwt.accessExpiresIn) * 60, // Convert minutes to seconds
+  };
+};
+</file>
+
+<file path="src/api/controllers/doctor.controller.ts">
+// server/src/api/controllers/doctor.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { Op } from 'sequelize';
+import { v4 as uuidv4 } from 'uuid';
+import Doctor from '../../database/models/Doctor';
+import User from '../../database/models/User';
+import Specialization from '../../database/models/Specialization';
+import DoctorSpecialization from '../../database/models/DoctorSpecialization';
+import Clinic from '../../database/models/Clinic';
+import DoctorClinic from '../../database/models/DoctorClinic';
+import { AuthRequest } from '../../middleware/auth.middleware';
+import { PaginatedResponse } from '../../types';
+
+/**
+ * Get all doctors
+ * @route GET /api/v1/doctors
+ * @access Public
+ */
+export const getDoctors = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const offset = (page - 1) * limit;
+    const search = req.query.search as string;
+    const specialization = req.query.specialization as string;
+
+    // Build query
+    const where: any = {
+      status: 'active',
+    };
+
+    // Search by name
+    if (search) {
+      where['$user.firstName$'] = { [Op.iLike]: `%${search}%` };
+      where['$user.lastName$'] = { [Op.iLike]: `%${search}%` };
+    }
+
+    // Filter by specialization
+    let specializationFilter = {};
+    if (specialization) {
+      specializationFilter = {
+        '$specializations.specialization.name$': specialization,
+      };
+    }
+
+    // Get doctors
+    const { count, rows } = await Doctor.findAndCountAll({
+      where: {
+        ...where,
+        ...specializationFilter,
+      },
+      include: [
+        {
+          model: User,
+          attributes: ['id', 'firstName', 'lastName', 'email', 'profileImage'],
+        },
+        {
+          model: DoctorSpecialization,
+          include: [
+            {
+              model: Specialization,
+              attributes: ['id', 'name'],
+            },
+          ],
+        },
+      ],
+      limit,
+      offset,
+      distinct: true,
+    });
+
+    // Format data
+    const doctors = rows.map(doctor => ({
+      id: doctor.id,
+      user: {
+        id: doctor.user.id,
+        firstName: doctor.user.firstName,
+        lastName: doctor.user.lastName,
+        profileImage: doctor.user.profileImage,
+      },
+      biography: doctor.biography,
+      consultationFee: doctor.consultationFee,
+      homeVisitFee: doctor.homeVisitFee,
+      offersHomeVisit: doctor.offersHomeVisit,
+      offersTeleConsultation: doctor.offersTeleConsultation,
+      averageRating: doctor.averageRating,
+      totalRatings: doctor.totalRatings,
+      specializations: doctor.specializations.map(s => ({
+        id: s.specialization.id,
+        name: s.specialization.name,
+        isPrimary: s.isPrimary,
+      })),
+    }));
+
+    const response: PaginatedResponse<(typeof doctors)[0]> = {
+      data: doctors,
+      pagination: {
+        page,
+        limit,
+        totalItems: count,
+        totalPages: Math.ceil(count / limit),
+      },
+    };
+
+    res.status(200).json({
+      success: true,
+      ...response,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get doctor by ID
+ * @route GET /api/v1/doctors/:id
+ * @access Public
+ */
+export const getDoctorById = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    const doctor = await Doctor.findByPk(id, {
+      include: [
+        {
+          model: User,
+          attributes: ['id', 'firstName', 'lastName', 'email', 'profileImage'],
+        },
+        {
+          model: DoctorSpecialization,
+          include: [
+            {
+              model: Specialization,
+              attributes: ['id', 'name', 'description'],
+            },
+          ],
+        },
+        {
+          model: DoctorClinic,
+          include: [
+            {
+              model: Clinic,
+              attributes: ['id', 'name', 'address', 'phone', 'email'],
+            },
+          ],
+        },
+      ],
+    });
+
+    if (!doctor) {
+      res.status(404);
+      throw new Error('Doctor not found');
+    }
+
+    // Format data
+    const formattedDoctor = {
+      id: doctor.id,
+      user: {
+        id: doctor.user.id,
+        firstName: doctor.user.firstName,
+        lastName: doctor.user.lastName,
+        profileImage: doctor.user.profileImage,
+      },
+      biography: doctor.biography,
+      education: doctor.education,
+      experience: doctor.experience,
+      consultationFee: doctor.consultationFee,
+      homeVisitFee: doctor.homeVisitFee,
+      offersHomeVisit: doctor.offersHomeVisit,
+      offersTeleConsultation: doctor.offersTeleConsultation,
+      averageRating: doctor.averageRating,
+      totalRatings: doctor.totalRatings,
+      specializations: doctor.specializations.map(s => ({
+        id: s.specialization.id,
+        name: s.specialization.name,
+        description: s.specialization.description,
+        isPrimary: s.isPrimary,
+      })),
+      clinics: doctor.doctorClinics.map(dc => ({
+        id: dc.clinic.id,
+        name: dc.clinic.name,
+        address: dc.clinic.address,
+        phone: dc.clinic.phone,
+        consultationFee: dc.consultationFee,
+      })),
+    };
+
+    res.status(200).json({
+      success: true,
+      data: formattedDoctor,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Update doctor profile
+ * @route PUT /api/v1/doctors/profile
+ * @access Private (Doctor)
+ */
+export const updateDoctorProfile = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const user = await User.findByPk(req.user.id);
+    if (!user || user.role !== 'doctor') {
+      res.status(403);
+      throw new Error('Not authorized as a doctor');
+    }
+
+    const doctor = await Doctor.findOne({ where: { userId: user.id } });
+    if (!doctor) {
+      res.status(404);
+      throw new Error('Doctor profile not found');
+    }
+
+    const {
+      biography,
+      education,
+      experience,
+      consultationFee,
+      homeVisitFee,
+      offersHomeVisit,
+      offersTeleConsultation,
+    } = req.body;
+
+    // Update doctor profile
+    const updatedDoctor = await doctor.update({
+      biography: biography || doctor.biography,
+      education: education || doctor.education,
+      experience: experience || doctor.experience,
+      consultationFee: consultationFee || doctor.consultationFee,
+      homeVisitFee: homeVisitFee || doctor.homeVisitFee,
+      offersHomeVisit: offersHomeVisit !== undefined ? offersHomeVisit : doctor.offersHomeVisit,
+      offersTeleConsultation:
+        offersTeleConsultation !== undefined
+          ? offersTeleConsultation
+          : doctor.offersTeleConsultation,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Doctor profile updated successfully',
+      data: {
+        id: updatedDoctor.id,
+        biography: updatedDoctor.biography,
+        education: updatedDoctor.education,
+        experience: updatedDoctor.experience,
+        consultationFee: updatedDoctor.consultationFee,
+        homeVisitFee: updatedDoctor.homeVisitFee,
+        offersHomeVisit: updatedDoctor.offersHomeVisit,
+        offersTeleConsultation: updatedDoctor.offersTeleConsultation,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+</file>
+
+<file path="src/config/index.ts">
+import dotenv from 'dotenv';
+import path from 'path';
+
+// Load environment variables
+dotenv.config({ path: path.join(__dirname, '../../.env') });
+
+const config = {
+  env: process.env.NODE_ENV || 'development',
+  port: parseInt(process.env.PORT || '5000', 10),
+  db: {
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '5432', 10),
+    name: process.env.DB_NAME || 'doctordb',
+    user: process.env.DB_USER || 'postgres',
+    password: process.env.DB_PASSWORD || 'postgres',
+    dialect: 'postgres',
+  },
+  redis: {
+    host: process.env.REDIS_HOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT || '6379', 10),
+  },
+  jwt: {
+    secret: process.env.JWT_SECRET || 'your-secret-key',
+    accessExpiresIn: process.env.JWT_ACCESS_EXPIRES_IN || '15m',
+    refreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '7d',
+  },
+  bcrypt: {
+    saltRounds: 10,
+  },
+  corsOptions: {
+    origin:
+      process.env.NODE_ENV === 'production'
+        ? ['https://yourdomain.com']
+        : ['http://localhost:3000'],
+    credentials: true,
+  },
+};
+
+export default config;
+</file>
+
+<file path="src/database/models/Appointment.ts">
+// server/src/database/models/Appointment.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  ForeignKey,
+  BelongsTo,
+  HasOne,
+} from 'sequelize-typescript';
+import Doctor from './Doctor';
+import Patient from './Patient';
+import Clinic from './Clinic';
+import Consultation from './Consultation';
+import HomeVisit from './HomeVisit';
+import Payment from './Payment';
+import Prescription from './Prescription';
+import Rating from './Rating';
+
+export enum AppointmentType {
+  IN_CLINIC = 'in_clinic',
+  TELE_CONSULTATION = 'tele_consultation',
+  HOME_VISIT = 'home_visit',
+}
+
+export enum AppointmentStatus {
+  PENDING = 'pending',
+  CONFIRMED = 'confirmed',
+  IN_PROGRESS = 'in_progress',
+  COMPLETED = 'completed',
+  CANCELLED = 'cancelled',
+  NO_SHOW = 'no_show',
+  RESCHEDULED = 'rescheduled',
+}
+
+@Table({
+  tableName: 'appointments',
+})
+export default class Appointment extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => Patient)
+  @Column(DataType.UUID)
+  patientId!: string;
+
+  @BelongsTo(() => Patient)
+  patient!: Patient;
+
+  @ForeignKey(() => Doctor)
+  @Column(DataType.UUID)
+  doctorId!: string;
+
+  @BelongsTo(() => Doctor)
+  doctor!: Doctor;
+
+  @ForeignKey(() => Clinic)
+  @Column(DataType.UUID)
+  clinicId?: string;
+
+  @BelongsTo(() => Clinic)
+  clinic?: Clinic;
+
+  @Column(DataType.ENUM(...Object.values(AppointmentType)))
+  type!: AppointmentType;
+
+  @Column(DataType.ENUM(...Object.values(AppointmentStatus)))
+  status!: AppointmentStatus;
+
+  @Column(DataType.DATE)
+  scheduledStartTime!: Date;
+
+  @Column(DataType.DATE)
+  scheduledEndTime!: Date;
+
+  @Column(DataType.DATE)
+  actualStartTime?: Date;
+
+  @Column(DataType.DATE)
+  actualEndTime?: Date;
+
+  @Column(DataType.TEXT)
+  reason?: string;
+
+  @Column(DataType.TEXT)
+  symptoms?: string;
+
+  @Column(DataType.TEXT)
+  notes?: string;
+
+  @Column(DataType.DECIMAL(10, 2))
+  fee!: number;
+
+  @Column(DataType.BOOLEAN)
+  isPaid!: boolean;
+
+  @Column(DataType.BOOLEAN)
+  isRescheduled!: boolean;
+
+  @Column(DataType.UUID)
+  previousAppointmentId?: string;
+
+  // Relationships
+  @HasOne(() => Consultation)
+  consultation?: Consultation;
+
+  @HasOne(() => HomeVisit)
+  homeVisit?: HomeVisit;
+
+  @HasOne(() => Payment)
+  payment?: Payment;
+
+  @HasOne(() => Prescription)
+  prescription?: Prescription;
+
+  @HasOne(() => Rating)
+  rating?: Rating;
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+}
+</file>
+
+<file path="src/database/models/Clinic.ts">
+// server/src/database/models/Clinic.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  DeletedAt,
+  ForeignKey,
+  BelongsTo,
+  HasMany,
+} from 'sequelize-typescript';
+import User from './User';
+import DoctorClinic from './DoctorClinic';
+import ClinicSchedule from './DoctorClinicSchedule';
+
+@Table({
+  tableName: 'clinics',
+  paranoid: true,
+})
+export default class Clinic extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => User)
+  @Column(DataType.UUID)
+  adminId!: string;
+
+  @BelongsTo(() => User, 'adminId')
+  admin!: User;
+
+  @Column(DataType.STRING)
+  name!: string;
+
+  @Column(DataType.TEXT)
+  description?: string;
+
+  @Column(DataType.JSONB)
+  address!: {
+    street: string;
+    city: string;
+    state: string;
+    zipCode: string;
+    country: string;
+    coordinates?: {
+      latitude: number;
+      longitude: number;
+    };
+  };
+
+  @Column(DataType.STRING)
+  phone!: string;
+
+  @Column(DataType.STRING)
+  email?: string;
+
+  @Column(DataType.STRING)
+  website?: string;
+
+  @Column(DataType.JSONB)
+  operatingHours!: Array<{
+    day: number; // 0-6 for Sun-Sat
+    openTime: string; // HH:MM format
+    closeTime: string;
+    isClosed: boolean;
+  }>;
+
+  @Column(DataType.ARRAY(DataType.STRING))
+  facilities?: string[];
+
+  @Column(DataType.ARRAY(DataType.STRING))
+  images?: string[];
+
+  @Column(DataType.STRING)
+  registrationNumber?: string;
+
+  @Column(DataType.BOOLEAN)
+  isVerified!: boolean;
+
+  @Column(DataType.FLOAT)
+  averageRating?: number;
+
+  @Column(DataType.INTEGER)
+  totalRatings?: number;
+
+  // Relationships
+  @HasMany(() => DoctorClinic)
+  doctorClinics!: DoctorClinic[];
+
+  @HasMany(() => ClinicSchedule)
+  schedules!: ClinicSchedule[];
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+
+  @DeletedAt
+  deletedAt?: Date;
+}
+</file>
+
+<file path="src/database/models/Consultation.ts">
+// server/src/database/models/Consultation.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  ForeignKey,
+  BelongsTo,
+} from 'sequelize-typescript';
+import Appointment from './Appointment';
+
+export enum ConsultationStatus {
+  SCHEDULED = 'scheduled',
+  WAITING = 'waiting',
+  IN_PROGRESS = 'in_progress',
+  COMPLETED = 'completed',
+  MISSED = 'missed',
+  CANCELLED = 'cancelled',
+}
+
+@Table({
+  tableName: 'consultations',
+})
+export default class Consultation extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => Appointment)
+  @Column(DataType.UUID)
+  appointmentId!: string;
+
+  @BelongsTo(() => Appointment)
+  appointment!: Appointment;
+
+  @Column(DataType.ENUM(...Object.values(ConsultationStatus)))
+  status!: ConsultationStatus;
+
+  @Column(DataType.STRING)
+  sessionId?: string;
+
+  @Column(DataType.STRING)
+  sessionToken?: string;
+
+  @Column(DataType.DATE)
+  startTime?: Date;
+
+  @Column(DataType.DATE)
+  endTime?: Date;
+
+  @Column(DataType.INTEGER)
+  duration?: number; // in minutes
+
+  @Column(DataType.STRING)
+  recordingUrl?: string;
+
+  @Column(DataType.TEXT)
+  doctorNotes?: string;
+
+  @Column(DataType.JSONB)
+  metadata?: Record<string, any>;
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+}
+</file>
+
+<file path="src/database/models/Doctor.ts">
+// server/src/database/models/Doctor.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  DeletedAt,
+  ForeignKey,
+  BelongsTo,
+  HasMany,
+  AllowNull,
+} from 'sequelize-typescript';
+import User from './User';
+import Appointment from './Appointment';
+import DoctorClinic from './DoctorClinic';
+import DoctorSchedule from './DoctorSchedule';
+import DoctorSpecialization from './DoctorSpecialization';
+
+export enum DoctorStatus {
+  ACTIVE = 'active',
+  INACTIVE = 'inactive',
+  PENDING = 'pending',
+  SUSPENDED = 'suspended',
+}
+
+@Table({
+  tableName: 'doctors',
+  paranoid: true,
+})
+export default class Doctor extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => User)
+  @Column(DataType.UUID)
+  userId!: string;
+
+  @BelongsTo(() => User)
+  user!: User;
+
+  @Column(DataType.STRING)
+  licenseNumber!: string;
+
+  @Column(DataType.TEXT)
+  biography?: string;
+
+  @Column(DataType.JSONB)
+  education!: Array<{
+    degree: string;
+    institution: string;
+    year: number;
+  }>;
+
+  @Column(DataType.JSONB)
+  experience!: Array<{
+    position: string;
+    institution: string;
+    startYear: number;
+    endYear?: number;
+  }>;
+
+  @Column(DataType.DECIMAL(10, 2))
+  consultationFee!: number;
+
+  @Column(DataType.DECIMAL(10, 2))
+  homeVisitFee?: number;
+
+  @Column(DataType.BOOLEAN)
+  offersHomeVisit!: boolean;
+
+  @Column(DataType.BOOLEAN)
+  offersTeleConsultation!: boolean;
+
+  @Column(DataType.ENUM(...Object.values(DoctorStatus)))
+  status!: DoctorStatus;
+
+  @Column(DataType.FLOAT)
+  averageRating?: number;
+
+  @Column(DataType.INTEGER)
+  totalRatings?: number;
+
+  // Relationships
+  @HasMany(() => Appointment)
+  appointments!: Appointment[];
+
+  @HasMany(() => DoctorClinic)
+  doctorClinics!: DoctorClinic[];
+
+  @HasMany(() => DoctorSchedule)
+  schedules!: DoctorSchedule[];
+
+  @HasMany(() => DoctorSpecialization)
+  specializations!: DoctorSpecialization[];
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+
+  @DeletedAt
+  deletedAt?: Date;
+}
+</file>
+
+<file path="src/database/models/DoctorClinic.ts">
+// server/src/database/models/DoctorClinic.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  ForeignKey,
+  BelongsTo,
+  HasMany,
+} from 'sequelize-typescript';
+import Doctor from './Doctor';
+import Clinic from './Clinic';
+import DoctorClinicSchedule from './DoctorClinicSchedule';
+
+@Table({
+  tableName: 'doctor_clinics',
+})
+export default class DoctorClinic extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => Doctor)
+  @Column(DataType.UUID)
+  doctorId!: string;
+
+  @BelongsTo(() => Doctor)
+  doctor!: Doctor;
+
+  @ForeignKey(() => Clinic)
+  @Column(DataType.UUID)
+  clinicId!: string;
+
+  @BelongsTo(() => Clinic)
+  clinic!: Clinic;
+
+  @Column(DataType.DECIMAL(10, 2))
+  consultationFee!: number;
+
+  @Column(DataType.INTEGER)
+  consultationDuration!: number; // minutes
+
+  @Column(DataType.BOOLEAN)
+  isActive!: boolean;
+
+  @Column(DataType.TEXT)
+  notes?: string;
+
+  // Relationships
+  @HasMany(() => DoctorClinicSchedule)
+  schedules!: DoctorClinicSchedule[];
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+}
+</file>
+
+<file path="src/database/models/DoctorClinicSchedule.ts">
+// server/src/database/models/DoctorClinicSchedule.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  ForeignKey,
+  BelongsTo,
+} from 'sequelize-typescript';
+import DoctorClinic from './DoctorClinic';
+
+@Table({
+  tableName: 'doctor_clinic_schedules',
+})
+export default class DoctorClinicSchedule extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => DoctorClinic)
+  @Column(DataType.UUID)
+  doctorClinicId!: string;
+
+  @BelongsTo(() => DoctorClinic)
+  doctorClinic!: DoctorClinic;
+
+  @Column(DataType.INTEGER)
+  dayOfWeek!: number; // 0-6 for Sun-Sat
+
+  @Column(DataType.TIME)
+  startTime!: string; // HH:MM:SS format
+
+  @Column(DataType.TIME)
+  endTime!: string;
+
+  @Column(DataType.INTEGER)
+  slotDuration!: number; // minutes
+
+  @Column(DataType.INTEGER)
+  maxPatients?: number; // max patients per slot, null for unlimited
+
+  @Column(DataType.BOOLEAN)
+  isActive!: boolean;
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+}
+</file>
+
+<file path="src/database/models/DoctorSpecialization.ts">
+// server/src/database/models/DoctorSpecialization.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  ForeignKey,
+  BelongsTo,
+} from 'sequelize-typescript';
+import Doctor from './Doctor';
+import Specialization from './Specialization';
+
+@Table({
+  tableName: 'doctor_specializations',
+})
+export default class DoctorSpecialization extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => Doctor)
+  @Column(DataType.UUID)
+  doctorId!: string;
+
+  @BelongsTo(() => Doctor)
+  doctor!: Doctor;
+
+  @ForeignKey(() => Specialization)
+  @Column(DataType.UUID)
+  specializationId!: string;
+
+  @BelongsTo(() => Specialization)
+  specialization!: Specialization;
+
+  @Column(DataType.BOOLEAN)
+  isPrimary!: boolean;
+
+  @Column(DataType.DATE)
+  certificationDate?: Date;
+
+  @Column(DataType.STRING)
+  certificationNumber?: string;
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+}
+</file>
+
+<file path="src/database/models/HomeVisit.ts">
+// server/src/database/models/HomeVisit.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  ForeignKey,
+  BelongsTo,
+} from 'sequelize-typescript';
+import Appointment from './Appointment';
+
+export enum HomeVisitStatus {
+  SCHEDULED = 'scheduled',
+  EN_ROUTE = 'en_route',
+  ARRIVED = 'arrived',
+  IN_PROGRESS = 'in_progress',
+  COMPLETED = 'completed',
+  CANCELLED = 'cancelled',
+}
+
+@Table({
+  tableName: 'home_visits',
+})
+export default class HomeVisit extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => Appointment)
+  @Column(DataType.UUID)
+  appointmentId!: string;
+
+  @BelongsTo(() => Appointment)
+  appointment!: Appointment;
+
+  @Column(DataType.ENUM(...Object.values(HomeVisitStatus)))
+  status!: HomeVisitStatus;
+
+  @Column(DataType.JSONB)
+  address!: {
+    street: string;
+    city: string;
+    state: string;
+    zipCode: string;
+    country: string;
+    coordinates?: {
+      latitude: number;
+      longitude: number;
+    };
+    additionalInfo?: string;
+  };
+
+  @Column(DataType.DATE)
+  estimatedArrivalTime?: Date;
+
+  @Column(DataType.DATE)
+  actualArrivalTime?: Date;
+
+  @Column(DataType.DATE)
+  visitStartTime?: Date;
+
+  @Column(DataType.DATE)
+  visitEndTime?: Date;
+
+  @Column(DataType.TEXT)
+  doctorNotes?: string;
+
+  @Column(DataType.JSONB)
+  metadata?: Record<string, any>;
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+}
+</file>
+
+<file path="src/database/models/Patient.ts">
+// server/src/database/models/Patient.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  DeletedAt,
+  ForeignKey,
+  BelongsTo,
+  HasMany,
+} from 'sequelize-typescript';
+import User from './User';
+import Appointment from './Appointment';
+
+@Table({
+  tableName: 'patients',
+  paranoid: true,
+})
+export default class Patient extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => User)
+  @Column(DataType.UUID)
+  userId!: string;
+
+  @BelongsTo(() => User)
+  user!: User;
+
+  @Column(DataType.DATEONLY)
+  dateOfBirth?: Date;
+
+  @Column(DataType.ENUM('male', 'female', 'other'))
+  gender?: string;
+
+  @Column(DataType.TEXT)
+  allergies?: string;
+
+  @Column(DataType.TEXT)
+  chronicDiseases?: string;
+
+  @Column(DataType.TEXT)
+  currentMedications?: string;
+
+  @Column(DataType.JSONB)
+  medicalHistory?: Record<string, any>;
+
+  @Column(DataType.STRING)
+  emergencyContactName?: string;
+
+  @Column(DataType.STRING)
+  emergencyContactPhone?: string;
+
+  @Column(DataType.STRING)
+  emergencyContactRelation?: string;
+
+  // Relationships
+  @HasMany(() => Appointment)
+  appointments!: Appointment[];
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+
+  @DeletedAt
+  deletedAt?: Date;
+}
+</file>
+
+<file path="src/database/models/Payment.ts">
+// server/src/database/models/Payment.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  ForeignKey,
+  BelongsTo,
+} from 'sequelize-typescript';
+import Appointment from './Appointment';
+
+export enum PaymentStatus {
+  PENDING = 'pending',
+  COMPLETED = 'completed',
+  FAILED = 'failed',
+  REFUNDED = 'refunded',
+  PARTIALLY_REFUNDED = 'partially_refunded',
+}
+
+export enum PaymentMethod {
+  CREDIT_CARD = 'credit_card',
+  DEBIT_CARD = 'debit_card',
+  BANK_TRANSFER = 'bank_transfer',
+  WALLET = 'wallet',
+  CASH = 'cash',
+  OTHER = 'other',
+}
+
+@Table({
+  tableName: 'payments',
+})
+export default class Payment extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => Appointment)
+  @Column(DataType.UUID)
+  appointmentId!: string;
+
+  @BelongsTo(() => Appointment)
+  appointment!: Appointment;
+
+  @Column(DataType.DECIMAL(10, 2))
+  amount!: number;
+
+  @Column(DataType.DECIMAL(10, 2))
+  tax?: number;
+
+  @Column(DataType.DECIMAL(10, 2))
+  platformFee?: number;
+
+  @Column(DataType.DECIMAL(10, 2))
+  doctorAmount?: number;
+
+  @Column(DataType.ENUM(...Object.values(PaymentStatus)))
+  status!: PaymentStatus;
+
+  @Column(DataType.ENUM(...Object.values(PaymentMethod)))
+  method!: PaymentMethod;
+
+  @Column(DataType.STRING)
+  transactionId?: string;
+
+  @Column(DataType.JSONB)
+  gatewayResponse?: Record<string, any>;
+
+  @Column(DataType.STRING)
+  invoiceNumber?: string;
+
+  @Column(DataType.DATE)
+  paidAt?: Date;
+
+  @Column(DataType.STRING)
+  refundReason?: string;
+
+  @Column(DataType.DECIMAL(10, 2))
+  refundAmount?: number;
+
+  @Column(DataType.DATE)
+  refundedAt?: Date;
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+}
+</file>
+
+<file path="src/database/models/Prescription.ts">
+// server/src/database/models/Prescription.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  ForeignKey,
+  BelongsTo,
+  HasMany,
+} from 'sequelize-typescript';
+import Appointment from './Appointment';
+import Doctor from './Doctor';
+import Patient from './Patient';
+import PrescriptionMedication from './PrescriptionMedication';
+
+@Table({
+  tableName: 'prescriptions',
+})
+export default class Prescription extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => Appointment)
+  @Column(DataType.UUID)
+  appointmentId!: string;
+
+  @BelongsTo(() => Appointment)
+  appointment!: Appointment;
+
+  @ForeignKey(() => Doctor)
+  @Column(DataType.UUID)
+  doctorId!: string;
+
+  @BelongsTo(() => Doctor)
+  doctor!: Doctor;
+
+  @ForeignKey(() => Patient)
+  @Column(DataType.UUID)
+  patientId!: string;
+
+  @BelongsTo(() => Patient)
+  patient!: Patient;
+
+  @Column(DataType.TEXT)
+  diagnosis?: string;
+
+  @Column(DataType.TEXT)
+  instructions?: string;
+
+  @Column(DataType.TEXT)
+  notes?: string;
+
+  @Column(DataType.DATEONLY)
+  validUntil?: Date;
+
+  @Column(DataType.BOOLEAN)
+  isDigitallySigned!: boolean;
+
+  @Column(DataType.STRING)
+  digitalSignature?: string;
+
+  @Column(DataType.STRING)
+  prescriptionUrl?: string;
+
+  // Relationships
+  @HasMany(() => PrescriptionMedication)
+  medications!: PrescriptionMedication[];
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+}
+</file>
+
+<file path="src/database/models/PrescriptionMedication.ts">
+// server/src/database/models/PrescriptionMedication.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  ForeignKey,
+  BelongsTo,
+} from 'sequelize-typescript';
+import Prescription from './Prescription';
+
+@Table({
+  tableName: 'prescription_medications',
+})
+export default class PrescriptionMedication extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => Prescription)
+  @Column(DataType.UUID)
+  prescriptionId!: string;
+
+  @BelongsTo(() => Prescription)
+  prescription!: Prescription;
+
+  @Column(DataType.STRING)
+  name!: string;
+
+  @Column(DataType.STRING)
+  dosage!: string;
+
+  @Column(DataType.STRING)
+  frequency!: string;
+
+  @Column(DataType.INTEGER)
+  duration!: number;
+
+  @Column(DataType.STRING)
+  durationUnit!: string; // days, weeks, months
+
+  @Column(DataType.BOOLEAN)
+  isBeforeMeal!: boolean;
+
+  @Column(DataType.TEXT)
+  instructions?: string;
+
+  @Column(DataType.TEXT)
+  notes?: string;
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+}
+</file>
+
+<file path="src/database/models/Rating.ts">
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  ForeignKey,
+  BelongsTo,
+} from 'sequelize-typescript';
+import Appointment from './Appointment';
+import Doctor from './Doctor';
+import Patient from './Patient';
+import Clinic from './Clinic';
+
+@Table({
+  tableName: 'ratings',
+})
+export default class Rating extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @ForeignKey(() => Appointment)
+  @Column(DataType.UUID)
+  appointmentId!: string;
+
+  @BelongsTo(() => Appointment)
+  appointment!: Appointment;
+
+  @ForeignKey(() => Doctor)
+  @Column(DataType.UUID)
+  doctorId!: string;
+
+  @BelongsTo(() => Doctor)
+  doctor!: Doctor;
+
+  @ForeignKey(() => Patient)
+  @Column(DataType.UUID)
+  patientId!: string;
+
+  @BelongsTo(() => Patient)
+  patient!: Patient;
+
+  @ForeignKey(() => Clinic)
+  @Column(DataType.UUID)
+  clinicId?: string;
+
+  @BelongsTo(() => Clinic)
+  clinic?: Clinic;
+
+  @Column(DataType.INTEGER)
+  doctorRating!: number; // 1-5
+
+  @Column(DataType.INTEGER)
+  clinicRating?: number; // 1-5
+
+  @Column(DataType.TEXT)
+  review?: string;
+
+  @Column(DataType.BOOLEAN)
+  isAnonymous!: boolean;
+
+  @Column(DataType.BOOLEAN)
+  isVerified!: boolean;
+
+  @Column(DataType.BOOLEAN)
+  isPublished!: boolean;
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+}
+</file>
+
+<file path="src/database/models/Specialization.ts">
+// server/src/database/models/Specialization.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  HasMany,
+} from 'sequelize-typescript';
+import DoctorSpecialization from './DoctorSpecialization';
+
+@Table({
+  tableName: 'specializations',
+})
+export default class Specialization extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @Column(DataType.STRING)
+  name!: string;
+
+  @Column(DataType.TEXT)
+  description?: string;
+
+  @Column(DataType.STRING)
+  icon?: string;
+
+  // Relationships
+  @HasMany(() => DoctorSpecialization)
+  doctorSpecializations!: DoctorSpecialization[];
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+}
+</file>
+
+<file path="src/database/models/User.ts">
+// server/src/database/models/User.ts
+import {
+  Table,
+  Column,
+  Model,
+  DataType,
+  CreatedAt,
+  UpdatedAt,
+  DeletedAt,
+  BeforeCreate,
+  BeforeUpdate,
+  HasOne,
+  Unique,
+  AllowNull,
+} from 'sequelize-typescript';
+import bcrypt from 'bcryptjs';
+import config from '../../config';
+import Doctor from './Doctor';
+import Patient from './Patient';
+
+export enum UserRole {
+  ADMIN = 'admin',
+  DOCTOR = 'doctor',
+  PATIENT = 'patient',
+  CLINIC_ADMIN = 'clinic_admin',
+}
+
+@Table({
+  tableName: 'users',
+  paranoid: true, // Soft deletes
+})
+export default class User extends Model {
+  @Column({
+    type: DataType.UUID,
+    defaultValue: DataType.UUIDV4,
+    primaryKey: true,
+  })
+  id!: string;
+
+  @AllowNull(false)
+  @Column(DataType.STRING)
+  firstName!: string;
+
+  @AllowNull(false)
+  @Column(DataType.STRING)
+  lastName!: string;
+
+  @Unique
+  @AllowNull(false)
+  @Column(DataType.STRING)
+  email!: string;
+
+  @Unique
+  @Column(DataType.STRING)
+  phone!: string;
+
+  @AllowNull(false)
+  @Column(DataType.STRING)
+  password!: string;
+
+  @Column(DataType.ENUM(...Object.values(UserRole)))
+  role!: UserRole;
+
+  @Column(DataType.STRING)
+  profileImage?: string;
+
+  @Column(DataType.JSONB)
+  address?: Record<string, any>;
+
+  @Column(DataType.BOOLEAN)
+  isEmailVerified!: boolean;
+
+  @Column(DataType.BOOLEAN)
+  isPhoneVerified!: boolean;
+
+  @Column(DataType.BOOLEAN)
+  isActive!: boolean;
+
+  @Column(DataType.DATE)
+  lastLogin?: Date;
+
+  @Column(DataType.STRING)
+  refreshToken?: string;
+
+  // Virtual field (not stored in DB)
+  @Column(DataType.VIRTUAL)
+  get fullName(): string {
+    return `${this.firstName} ${this.lastName}`;
+  }
+
+  // Relationships
+  @HasOne(() => Doctor)
+  doctor?: Doctor;
+
+  @HasOne(() => Patient)
+  patient?: Patient;
+
+  // Timestamps
+  @CreatedAt
+  createdAt!: Date;
+
+  @UpdatedAt
+  updatedAt!: Date;
+
+  @DeletedAt
+  deletedAt?: Date;
+
+  // Hash password before saving
+  @BeforeCreate
+  @BeforeUpdate
+  static async hashPassword(instance: User): Promise<void> {
+    // Only hash the password if it has been modified (or is new)
+    if (instance.changed('password')) {
+      const salt = await bcrypt.genSalt(config.bcrypt.saltRounds);
+      instance.password = await bcrypt.hash(instance.password, salt);
+    }
+  }
+
+  // Compare password method
+  async comparePassword(candidatePassword: string): Promise<boolean> {
+    return bcrypt.compare(candidatePassword, this.password);
+  }
+}
+</file>
+
+<file path="src/database/index.ts">
+// server/src/database/index.ts
+import { Sequelize } from 'sequelize-typescript';
+import config from '../config';
+import logger from '../utils/logger';
+
+export const sequelize = new Sequelize({
+  host: config.db.host,
+  port: config.db.port,
+  database: config.db.name,
+  dialect: 'postgres',
+  username: config.db.user,
+  password: config.db.password,
+  models: [__dirname + '/models'],
+  logging: msg => logger.debug(msg),
+  pool: {
+    max: 5,
+    min: 0,
+    acquire: 30000,
+    idle: 10000,
+  },
+});
+
+// Test database connection
+export const testDbConnection = async (): Promise<void> => {
+  try {
+    await sequelize.authenticate();
+    logger.info('Database connection established successfully');
+  } catch (error) {
+    logger.error('Unable to connect to the database:', error);
+    process.exit(1);
+  }
+};
+</file>
+
+<file path="src/middleware/auth.middleware.ts">
+// server/src/middleware/auth.middleware.ts
+import { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
+import config from '../config';
+import { JwtPayload } from '../types';
+
+export interface AuthRequest extends Request {
+  user?: JwtPayload;
+}
+
+export const protect = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  let token: string | undefined;
+
+  // Check for token in headers
+  if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+    token = req.headers.authorization.split(' ')[1];
+  }
+
+  if (!token) {
+    res.status(401);
+    return next(new Error('Not authorized, no token'));
+  }
+
+  try {
+    // Verify token
+    const decoded = jwt.verify(token, config.jwt.secret) as JwtPayload;
+    req.user = decoded;
+    next();
+  } catch (error) {
+    res.status(401);
+    next(new Error('Not authorized, token failed'));
+  }
+};
+
+export const authorize = (...roles: string[]) => {
+  return (req: AuthRequest, res: Response, next: NextFunction): void => {
+    if (!req.user) {
+      res.status(401);
+      return next(new Error('Not authorized, no token'));
+    }
+
+    if (!roles.includes(req.user.role)) {
+      res.status(403);
+      return next(new Error('Not authorized, insufficient permissions'));
+    }
+
+    next();
+  };
+};
+</file>
+
+<file path="src/middleware/error.middleware.ts">
+// server/src/middleware/error.middleware.ts
+import { Request, Response, NextFunction } from 'express';
+import { ValidationError } from 'sequelize';
+import { ErrorResponse } from '../types';
+import logger from '../utils/logger';
+import config from '../config';
+
+export const notFound = (req: Request, res: Response, next: NextFunction): void => {
+  const error = new Error(`Not Found - ${req.originalUrl}`);
+  res.status(404);
+  next(error);
+};
+
+export const errorHandler = (
+  err: Error,
+  req: Request,
+  res: Response<ErrorResponse>,
+  next: NextFunction
+): void => {
+  let statusCode = res.statusCode === 200 ? 500 : res.statusCode;
+  let message = err.message;
+  let errors: Record<string, string[]> | undefined;
+
+  // Log the error
+  logger.error(`${req.method} ${req.url} ${statusCode} - ${err.message}`);
+
+  // Handle Sequelize validation errors
+  if (err instanceof ValidationError) {
+    statusCode = 400;
+    message = 'Validation Error';
+    errors = {};
+    err.errors.forEach(error => {
+      const path = error.path || 'unknown';
+      if (!errors![path]) {
+        errors![path] = [];
+      }
+      errors![path].push(error.message);
+    });
+  }
+
+  res.status(statusCode).json({
+    message,
+    ...(config.env === 'development' && { stack: err.stack }),
+    ...(errors && { errors }),
+  });
+};
+</file>
+
+<file path="src/routes/index.ts">
+// server/src/routes/index.ts
+import { Router } from 'express';
+import authRoutes from './auth.routes';
+import userRoutes from './user.routes';
+import doctorRoutes from './doctor.routes';
+import clinicRoutes from './clinic.routes';
+import appointmentRoutes from './appointment.routes';
+import consultationRoutes from './consultation.routes';
+
+const router = Router();
+
+// Health check endpoint
+router.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok' });
+});
+
+// API routes
+router.use('/auth', authRoutes);
+router.use('/users', userRoutes);
+router.use('/doctors', doctorRoutes);
+router.use('/clinics', clinicRoutes);
+router.use('/appointments', appointmentRoutes);
+router.use('/consultations', consultationRoutes);
+
+export default router;
+</file>
+
+<file path="src/services/socket.service.ts">
+// server/src/services/socket.service.ts
+import { Server as HttpServer } from 'http';
+import { Server, Socket } from 'socket.io';
+import logger from '../utils/logger';
+import config from '../config';
+
+let io: Server;
+
+export const initializeSocketIO = (server: HttpServer): void => {
+  io = new Server(server, {
+    cors: config.corsOptions,
+    pingTimeout: 60000,
+  });
+
+  io.on('connection', (socket: Socket) => {
+    logger.info(`Socket connected: ${socket.id}`);
+
+    // Join a room for private communication
+    socket.on('join-room', (roomId: string) => {
+      socket.join(roomId);
+      logger.debug(`Socket ${socket.id} joined room: ${roomId}`);
+    });
+
+    // Leave a room
+    socket.on('leave-room', (roomId: string) => {
+      socket.leave(roomId);
+      logger.debug(`Socket ${socket.id} left room: ${roomId}`);
+    });
+
+    // Handle video call signaling
+    socket.on(
+      'call-user',
+      (data: { userToCall: string; signalData: any; from: string; name: string }) => {
+        io.to(data.userToCall).emit('call-user', {
+          signal: data.signalData,
+          from: data.from,
+          name: data.name,
+        });
+      }
+    );
+
+    socket.on('answer-call', (data: { to: string; signal: any }) => {
+      io.to(data.to).emit('call-accepted', data.signal);
+    });
+
+    // Handle disconnection
+    socket.on('disconnect', () => {
+      logger.info(`Socket disconnected: ${socket.id}`);
+    });
+  });
+};
+
+export const getIO = (): Server => {
+  if (!io) {
+    throw new Error('Socket.io not initialized!');
+  }
+  return io;
+};
+</file>
+
+<file path="src/types/environment.d.ts">
+// server/src/types/environment.d.ts
+declare global {
+  namespace NodeJS {
+    interface ProcessEnv {
+      NODE_ENV: 'development' | 'production' | 'test';
+      PORT: string;
+      DB_HOST: string;
+      DB_PORT: string;
+      DB_NAME: string;
+      DB_USER: string;
+      DB_PASSWORD: string;
+      REDIS_HOST: string;
+      REDIS_PORT: string;
+      JWT_SECRET: string;
+      JWT_ACCESS_EXPIRES_IN: string;
+      JWT_REFRESH_EXPIRES_IN: string;
+    }
+  }
+}
+
+export {};
+</file>
+
+<file path="src/types/index.ts">
+export interface ErrorResponse {
+  message: string;
+  stack?: string;
+  errors?: Record<string, string[]>;
+}
+
+export interface JwtPayload {
+  id: number;
+  email: string;
+  role: string;
+}
+
+export interface TokenResponse {
+  accessToken: string;
+  refreshToken: string;
+  expiresIn: number;
+}
+
+export interface Pagination {
+  page: number;
+  limit: number;
+  totalItems: number;
+  totalPages: number;
+}
+
+export type PaginatedResponse<T> = {
+  data: T[];
+  pagination: Pagination;
+};
+</file>
+
+<file path="src/utils/logger.ts">
+// server/src/utils/logger.ts
+import winston from 'winston';
+import config from '../config';
+
+const levels = {
+  error: 0,
+  warn: 1,
+  info: 2,
+  http: 3,
+  debug: 4,
+};
+
+const level = () => {
+  return config.env === 'development' ? 'debug' : 'info';
+};
+
+const colors = {
+  error: 'red',
+  warn: 'yellow',
+  info: 'green',
+  http: 'magenta',
+  debug: 'white',
+};
+
+winston.addColors(colors);
+
+const format = winston.format.combine(
+  winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+  winston.format.colorize({ all: true }),
+  winston.format.printf(info => `${info.timestamp} ${info.level}: ${info.message}`)
+);
+
+const transports = [
+  new winston.transports.Console(),
+  new winston.transports.File({
+    filename: 'logs/error.log',
+    level: 'error',
+  }),
+  new winston.transports.File({ filename: 'logs/all.log' }),
+];
+
+const logger = winston.createLogger({
+  level: level(),
+  levels,
+  format,
+  transports,
+});
+
+export default logger;
+</file>
+
+<file path="src/app.ts">
+// server/src/app.ts
+import express, { Application } from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import compression from 'compression';
+import morgan from 'morgan';
+import { createStream } from 'rotating-file-stream';
+import path from 'path';
+import { errorHandler, notFound } from './middleware/error.middleware';
+import config from './config';
+import routes from './routes';
+
+// Create a rotating write stream for access logs
+const accessLogStream = createStream('access.log', {
+  interval: '1d',
+  path: path.join(__dirname, '../logs'),
+});
+
+const app: Application = express();
+
+// Security middleware
+app.use(cors(config.corsOptions));
+app.use(helmet());
+app.use(compression());
+
+// Request parsing
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Logging
+if (config.env === 'development') {
+  app.use(morgan('dev'));
+} else {
+  app.use(morgan('combined', { stream: accessLogStream }));
+}
+
+// API Routes
+app.use('/api/v1', routes);
+
+// Error handling
+app.use(notFound);
+app.use(errorHandler);
+
+export default app;
+</file>
+
+<file path="src/index.ts">
+// server/src/index.ts
+import http from 'http';
+import app from './app';
+import config from './config';
+import logger from './utils/logger';
+import { initializeSocketIO } from './services/socket.service';
+import { sequelize } from './database';
+
+const server = http.createServer(app);
+
+// Initialize socket.io
+initializeSocketIO(server);
+
+// Database synchronization (in development only)
+if (config.env === 'development') {
+  sequelize.sync({ alter: true }).then(() => {
+    logger.info('Database synchronized');
+  });
+}
+
+server.listen(config.port, () => {
+  logger.info(`Server running on port ${config.port} in ${config.env} mode`);
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (err: Error) => {
+  logger.error('Unhandled Rejection:', err);
+  // Don't crash in production, but exit in development to catch errors early
+  if (config.env === 'development') {
+    process.exit(1);
+  }
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err: Error) => {
+  logger.error('Uncaught Exception:', err);
+  process.exit(1);
+});
+</file>
+
+<file path="jest.config.ts">
+import type { Config } from '@jest/types';
+
+const config: Config.InitialOptions = {
+  preset: 'ts-jest',
+  testEnvironment: 'node',
+  roots: ['<rootDir>/src'],
+  transform: {
+    '^.+\\.tsx?$': 'ts-jest',
+  },
+  moduleNameMapper: {
+    '^@/(.*)$': '<rootDir>/src/$1',
+  },
+  coverageDirectory: 'coverage',
+  collectCoverageFrom: [
+    'src/**/*.{ts,tsx}',
+    '!src/**/*.d.ts',
+    '!src/types/**/*.ts',
+    '!src/database/migrations/**/*.ts',
+    '!src/database/seeders/**/*.ts',
+  ],
+  verbose: true,
+};
+
+export default config;
+</file>
+
+<file path="package.json">
+{
+  "name": "doctor-appointment-server",
+  "version": "1.0.0",
+  "description": "Backend server for doctor appointment portal",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json",
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "lint": "eslint 'src/**/*.{ts,tsx}' --fix",
+    "test": "jest --coverage",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "sequelize-cli db:migrate",
+    "db:seed": "sequelize-cli db:seed:all"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "compression": "^1.7.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "express-rate-limit": "^6.7.0",
+    "express-validator": "^7.0.1",
+    "helmet": "^7.0.0",
+    "ioredis": "^5.3.2",
+    "jsonwebtoken": "^9.0.0",
+    "morgan": "^1.10.0",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.11.0",
+    "pg-hstore": "^2.3.4",
+    "sequelize": "^6.31.1",
+    "sequelize-typescript": "^2.1.5",
+    "socket.io": "^4.6.1",
+    "winston": "^3.8.2",
+    "zod": "^3.21.4"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.2",
+    "@types/compression": "^1.7.2",
+    "@types/cors": "^2.8.13",
+    "@types/express": "^4.17.17",
+    "@types/jest": "^29.5.1",
+    "@types/jsonwebtoken": "^9.0.2",
+    "@types/morgan": "^1.9.4",
+    "@types/multer": "^1.4.7",
+    "@types/node": "^20.1.4",
+    "@types/sequelize": "^4.28.15",
+    "@types/supertest": "^2.0.12",
+    "@typescript-eslint/eslint-plugin": "^5.59.5",
+    "@typescript-eslint/parser": "^5.59.5",
+    "eslint": "^8.40.0",
+    "eslint-config-prettier": "^8.8.0",
+    "eslint-plugin-prettier": "^4.2.1",
+    "jest": "^29.5.0",
+    "prettier": "^2.8.8",
+    "sequelize-cli": "^6.6.0",
+    "supertest": "^6.3.3",
+    "ts-jest": "^29.1.0",
+    "ts-node": "^10.9.1",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.0.4"
+  }
+}
+</file>
+
+<file path="tsconfig.json">
+{
+    "extends": "../tsconfig.json",
+    "compilerOptions": {
+      "outDir": "./dist",
+      "rootDir": "./src",
+      "baseUrl": "./src",
+      "paths": {
+        "@/*": ["./*"]
+      },
+      "typeRoots": ["./node_modules/@types", "./src/types"],
+      "types": ["node", "jest"],
+      "declaration": true,
+      "sourceMap": true,
+      "experimentalDecorators": true,
+      "emitDecoratorMetadata": true
+    },
+    "include": ["src/**/*"],
+    "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.spec.ts"]
+  }
+</file>
+
+</files>

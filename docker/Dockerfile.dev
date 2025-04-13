@@ -1,0 +1,20 @@
+# docker/Dockerfile.dev
+FROM node:18-alpine
+
+WORKDIR /app
+
+# Install Nginx
+RUN apk add --no-cache nginx
+RUN mkdir -p /run/nginx
+
+# Install nodemon for backend development
+RUN npm install -g nodemon
+
+# Copy Nginx configuration
+COPY nginx/default.conf /etc/nginx/http.d/default.conf
+
+# Expose ports
+EXPOSE 3000 5000 80
+
+# Start services for development
+CMD ["sh", "-c", "nginx -g 'daemon on;' && cd /app/server && npm run dev"]
