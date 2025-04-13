@@ -46,9 +46,18 @@ The content is organized as follows:
 src/
   api/
     controllers/
+      admin.controller.ts
       appointment.controller.ts
       auth.controller.ts
+      clinic.controller.ts
+      consultation.controller.ts
       doctor.controller.ts
+      patient.controller.ts
+      payment.controller.ts
+      prescription.controller.ts
+      rating.controller.ts
+      schedule.controller.ts
+      user.controller.ts
   config/
     index.ts
   database/
@@ -73,7 +82,16 @@ src/
     auth.middleware.ts
     error.middleware.ts
   routes/
+    admin.routes.ts
+    clinic.routes.ts
+    consultation.routes.ts
     index.ts
+    patient.routes.ts
+    payment.routes.ts
+    prescription.routes.ts
+    rating.routes.ts
+    schedule.routes.ts
+    user.routes.ts
   services/
     socket.service.ts
   types/
@@ -90,6 +108,376 @@ tsconfig.json
 
 <files>
 This section contains the contents of the repository's files.
+
+<file path="src/api/controllers/admin.controller.ts">
+// src/api/controllers/admin.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { Op } from 'sequelize';
+import User, { UserRole } from '../../database/models/User';
+import Doctor, { DoctorStatus } from '../../database/models/Doctor';
+import Appointment from '../../database/models/Appointment';
+import Payment from '../../database/models/Payment';
+import { AuthRequest } from '../../middleware/auth.middleware';
+import { PaginatedResponse } from '../../types';
+
+/**
+ * Get system dashboard statistics
+ * @route GET /api/v1/admin/dashboard
+ * @access Private (Admin)
+ */
+export const getDashboardStats = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    // Get user counts
+    const userCounts = await User.findAll({
+      attributes: [
+        'role',
+        [req.app.get('sequelize').fn('count', req.app.get('sequelize').col('id')), 'count'],
+      ],
+      group: ['role'],
+    });
+
+    // Format user counts
+    const formattedUserCounts = {
+      patients: userCounts.find(item => item.role === UserRole.PATIENT)?.get('count') || 0,
+      doctors: userCounts.find(item => item.role === UserRole.DOCTOR)?.get('count') || 0,
+      admins: userCounts.find(item => item.role === UserRole.ADMIN)?.get('count') || 0,
+      clinicAdmins: userCounts.find(item => item.role === UserRole.CLINIC_ADMIN)?.get('count') || 0,
+    };
+
+    // Get pending doctor approvals
+    const pendingDoctorCount = await Doctor.count({
+      where: { status: DoctorStatus.PENDING },
+    });
+
+    // Get appointment statistics
+    const appointmentCounts = await Appointment.findAll({
+      attributes: [
+        'status',
+        [req.app.get('sequelize').fn('count', req.app.get('sequelize').col('id')), 'count'],
+      ],
+      group: ['status'],
+    });
+
+    // Get today's appointments
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const todayAppointments = await Appointment.count({
+      where: {
+        scheduledStartTime: {
+          [Op.gte]: today,
+          [Op.lt]: tomorrow,
+        },
+      },
+    });
+
+    // Calculate revenue statistics
+    const totalRevenue = await Payment.sum('amount', {
+      where: { status: 'completed' },
+    });
+
+    const todayRevenue = await Payment.sum('amount', {
+      where: {
+        status: 'completed',
+        paidAt: {
+          [Op.gte]: today,
+          [Op.lt]: tomorrow,
+        },
+      },
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        userCounts: formattedUserCounts,
+        pendingDoctorApprovals: pendingDoctorCount,
+        appointmentStats: {
+          today: todayAppointments,
+          total: appointmentCounts.reduce(
+            (sum, item) => sum + parseInt(item.get('count') as string),
+            0
+          ),
+          completed: appointmentCounts.find(item => item.status === 'completed')?.get('count') || 0,
+          pending: appointmentCounts.find(item => item.status === 'pending')?.get('count') || 0,
+          cancelled: appointmentCounts.find(item => item.status === 'cancelled')?.get('count') || 0,
+        },
+        revenue: {
+          total: totalRevenue || 0,
+          today: todayRevenue || 0,
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get pending doctor approvals
+ * @route GET /api/v1/admin/doctors/pending
+ * @access Private (Admin)
+ */
+export const getPendingDoctors = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const offset = (page - 1) * limit;
+
+    // Get pending doctors
+    const { count, rows } = await Doctor.findAndCountAll({
+      where: { status: DoctorStatus.PENDING },
+      include: [
+        {
+          model: User,
+          attributes: ['id', 'firstName', 'lastName', 'email', 'phone', 'profileImage'],
+        },
+      ],
+      limit,
+      offset,
+      order: [['createdAt', 'ASC']],
+    });
+
+    // Format doctors
+    const doctors = rows.map(doctor => ({
+      id: doctor.id,
+      user: {
+        id: doctor.user.id,
+        firstName: doctor.user.firstName,
+        lastName: doctor.user.lastName,
+        email: doctor.user.email,
+        phone: doctor.user.phone,
+        profileImage: doctor.user.profileImage,
+      },
+      licenseNumber: doctor.licenseNumber,
+      education: doctor.education,
+      experience: doctor.experience,
+      createdAt: doctor.createdAt,
+    }));
+
+    const response: PaginatedResponse<(typeof doctors)[0]> = {
+      data: doctors,
+      pagination: {
+        page,
+        limit,
+        totalItems: count,
+        totalPages: Math.ceil(count / limit),
+      },
+    };
+
+    res.status(200).json({
+      success: true,
+      ...response,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Approve or reject doctor
+ * @route PUT /api/v1/admin/doctors/:id/status
+ * @access Private (Admin)
+ */
+export const updateDoctorStatus = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+    const { status, remarks } = req.body;
+
+    if (!Object.values(DoctorStatus).includes(status)) {
+      res.status(400);
+      throw new Error('Invalid status');
+    }
+
+    // Find doctor
+    const doctor = await Doctor.findByPk(id, {
+      include: [
+        {
+          model: User,
+          attributes: ['id', 'email'],
+        },
+      ],
+    });
+
+    if (!doctor) {
+      res.status(404);
+      throw new Error('Doctor not found');
+    }
+
+    // Update status
+    await doctor.update({
+      status,
+      // In a real app, we might add a remarks field to the Doctor model
+      // remarks: remarks
+    });
+
+    // In a real app, we would send an email notification to the doctor here
+
+    res.status(200).json({
+      success: true,
+      message: `Doctor ${status === DoctorStatus.ACTIVE ? 'approved' : 'updated'} successfully`,
+      data: {
+        id: doctor.id,
+        status: doctor.status,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get system users
+ * @route GET /api/v1/admin/users
+ * @access Private (Admin)
+ */
+export const getUsers = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const offset = (page - 1) * limit;
+    const role = req.query.role as string;
+    const search = req.query.search as string;
+
+    // Build query
+    let where: any = {};
+
+    if (role) {
+      where.role = role;
+    }
+
+    if (search) {
+      where = {
+        ...where,
+        [Op.or]: [
+          { firstName: { [Op.iLike]: `%${search}%` } },
+          { lastName: { [Op.iLike]: `%${search}%` } },
+          { email: { [Op.iLike]: `%${search}%` } },
+        ],
+      };
+    }
+
+    // Get users
+    const { count, rows } = await User.findAndCountAll({
+      where,
+      attributes: {
+        exclude: ['password', 'refreshToken'],
+      },
+      limit,
+      offset,
+      order: [['createdAt', 'DESC']],
+    });
+
+    const response: PaginatedResponse<User> = {
+      data: rows,
+      pagination: {
+        page,
+        limit,
+        totalItems: count,
+        totalPages: Math.ceil(count / limit),
+      },
+    };
+
+    res.status(200).json({
+      success: true,
+      ...response,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Update user status (activate/deactivate)
+ * @route PUT /api/v1/admin/users/:id/status
+ * @access Private (Admin)
+ */
+export const updateUserStatus = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+    const { isActive } = req.body;
+
+    if (isActive === undefined) {
+      res.status(400);
+      throw new Error('isActive is required');
+    }
+
+    // Find user
+    const user = await User.findByPk(id);
+
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    // Prevent deactivating own account
+    if (id === req.user.id.toString() && !isActive) {
+      res.status(400);
+      throw new Error('Cannot deactivate your own account');
+    }
+
+    // Update status
+    await user.update({ isActive });
+
+    res.status(200).json({
+      success: true,
+      message: `User ${isActive ? 'activated' : 'deactivated'} successfully`,
+      data: {
+        id: user.id,
+        isActive: user.isActive,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+</file>
 
 <file path="src/api/controllers/appointment.controller.ts">
 // server/src/api/controllers/appointment.controller.ts
@@ -1085,6 +1473,796 @@ const generateTokens = (user: User): TokenResponse => {
 };
 </file>
 
+<file path="src/api/controllers/clinic.controller.ts">
+// src/api/controllers/clinic.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import { Op } from 'sequelize';
+import Clinic from '../../database/models/Clinic';
+import User from '../../database/models/User';
+import Doctor from '../../database/models/Doctor';
+import DoctorClinic from '../../database/models/DoctorClinic';
+import DoctorClinicSchedule from '../../database/models/DoctorClinicSchedule';
+import { AuthRequest } from '../../middleware/auth.middleware';
+import { PaginatedResponse } from '../../types';
+
+/**
+ * Get all clinics
+ * @route GET /api/v1/clinics
+ * @access Public
+ */
+export const getClinics = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const offset = (page - 1) * limit;
+    const search = req.query.search as string;
+
+    // Build query
+    let where: any = { isVerified: true };
+
+    if (search) {
+      where = {
+        ...where,
+        [Op.or]: [
+          { name: { [Op.iLike]: `%${search}%` } },
+          { '$address.city$': { [Op.iLike]: `%${search}%` } },
+          { '$address.state$': { [Op.iLike]: `%${search}%` } },
+        ],
+      };
+    }
+
+    // Get clinics
+    const { count, rows } = await Clinic.findAndCountAll({
+      where,
+      limit,
+      offset,
+      order: [['name', 'ASC']],
+    });
+
+    // Format clinics
+    const clinics = rows.map(clinic => ({
+      id: clinic.id,
+      name: clinic.name,
+      address: clinic.address,
+      phone: clinic.phone,
+      email: clinic.email,
+      facilities: clinic.facilities,
+      images: clinic.images,
+      averageRating: clinic.averageRating,
+      totalRatings: clinic.totalRatings,
+    }));
+
+    const response: PaginatedResponse<(typeof clinics)[0]> = {
+      data: clinics,
+      pagination: {
+        page,
+        limit,
+        totalItems: count,
+        totalPages: Math.ceil(count / limit),
+      },
+    };
+
+    res.status(200).json({
+      success: true,
+      ...response,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get clinic by ID
+ * @route GET /api/v1/clinics/:id
+ * @access Public
+ */
+export const getClinicById = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { id } = req.params;
+
+    const clinic = await Clinic.findByPk(id, {
+      include: [
+        {
+          model: DoctorClinic,
+          include: [
+            {
+              model: Doctor,
+              include: [
+                {
+                  model: User,
+                  attributes: ['firstName', 'lastName', 'profileImage'],
+                },
+              ],
+            },
+            {
+              model: DoctorClinicSchedule,
+            },
+          ],
+        },
+      ],
+    });
+
+    if (!clinic) {
+      res.status(404);
+      throw new Error('Clinic not found');
+    }
+
+    // Format response
+    const formattedClinic = {
+      id: clinic.id,
+      name: clinic.name,
+      description: clinic.description,
+      address: clinic.address,
+      phone: clinic.phone,
+      email: clinic.email,
+      website: clinic.website,
+      operatingHours: clinic.operatingHours,
+      facilities: clinic.facilities,
+      images: clinic.images,
+      averageRating: clinic.averageRating,
+      totalRatings: clinic.totalRatings,
+      doctors: clinic.doctorClinics.map(dc => ({
+        id: dc.doctor.id,
+        name: `${dc.doctor.user.firstName} ${dc.doctor.user.lastName}`,
+        profileImage: dc.doctor.user.profileImage,
+        consultationFee: dc.consultationFee,
+        schedules: dc.schedules.map(s => ({
+          dayOfWeek: s.dayOfWeek,
+          startTime: s.startTime,
+          endTime: s.endTime,
+        })),
+      })),
+    };
+
+    res.status(200).json({
+      success: true,
+      data: formattedClinic,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Create a new clinic
+ * @route POST /api/v1/clinics
+ * @access Private (Admin, Clinic Admin)
+ */
+export const createClinic = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const {
+      name,
+      description,
+      address,
+      phone,
+      email,
+      website,
+      operatingHours,
+      facilities,
+      images,
+      registrationNumber,
+    } = req.body;
+
+    // Create clinic
+    const clinic = await Clinic.create({
+      id: uuidv4(),
+      adminId: req.user.id,
+      name,
+      description,
+      address,
+      phone,
+      email,
+      website,
+      operatingHours,
+      facilities,
+      images,
+      registrationNumber,
+      isVerified: req.user.role === 'admin', // Auto-verify if created by admin
+      averageRating: null,
+      totalRatings: 0,
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Clinic created successfully',
+      data: {
+        id: clinic.id,
+        name: clinic.name,
+        address: clinic.address,
+        phone: clinic.phone,
+        email: clinic.email,
+        isVerified: clinic.isVerified,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Update clinic
+ * @route PUT /api/v1/clinics/:id
+ * @access Private (Admin, Clinic Admin)
+ */
+export const updateClinic = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+    const {
+      name,
+      description,
+      address,
+      phone,
+      email,
+      website,
+      operatingHours,
+      facilities,
+      images,
+      registrationNumber,
+    } = req.body;
+
+    // Find clinic
+    const clinic = await Clinic.findByPk(id);
+
+    if (!clinic) {
+      res.status(404);
+      throw new Error('Clinic not found');
+    }
+
+    // Check authorization
+    if (req.user.role !== 'admin' && clinic.adminId !== req.user.id.toString()) {
+      res.status(403);
+      throw new Error('Not authorized to update this clinic');
+    }
+
+    // Update clinic
+    const updatedClinic = await clinic.update({
+      name: name || clinic.name,
+      description: description || clinic.description,
+      address: address || clinic.address,
+      phone: phone || clinic.phone,
+      email: email || clinic.email,
+      website: website || clinic.website,
+      operatingHours: operatingHours || clinic.operatingHours,
+      facilities: facilities || clinic.facilities,
+      images: images || clinic.images,
+      registrationNumber: registrationNumber || clinic.registrationNumber,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Clinic updated successfully',
+      data: {
+        id: updatedClinic.id,
+        name: updatedClinic.name,
+        address: updatedClinic.address,
+        phone: updatedClinic.phone,
+        email: updatedClinic.email,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Verify clinic
+ * @route PUT /api/v1/clinics/:id/verify
+ * @access Private (Admin)
+ */
+export const verifyClinic = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+    const { isVerified } = req.body;
+
+    if (isVerified === undefined) {
+      res.status(400);
+      throw new Error('isVerified is required');
+    }
+
+    // Find clinic
+    const clinic = await Clinic.findByPk(id);
+
+    if (!clinic) {
+      res.status(404);
+      throw new Error('Clinic not found');
+    }
+
+    // Update verification status
+    await clinic.update({ isVerified });
+
+    res.status(200).json({
+      success: true,
+      message: `Clinic ${isVerified ? 'verified' : 'unverified'} successfully`,
+      data: {
+        id: clinic.id,
+        isVerified: clinic.isVerified,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+</file>
+
+<file path="src/api/controllers/consultation.controller.ts">
+// src/api/controllers/consultation.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import Consultation, { ConsultationStatus } from '../../database/models/Consultation';
+import Appointment, { AppointmentStatus } from '../../database/models/Appointment';
+import Doctor from '../../database/models/Doctor';
+import Patient from '../../database/models/Patient';
+import User from '../../database/models/User';
+import { AuthRequest } from '../../middleware/auth.middleware';
+import { getIO } from '../../services/socket.service';
+
+/**
+ * Start a consultation session
+ * @route POST /api/v1/consultations/:id/start
+ * @access Private (Doctor)
+ */
+export const startConsultation = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+
+    // Find consultation
+    const consultation = await Consultation.findByPk(id, {
+      include: [
+        {
+          model: Appointment,
+          include: [
+            {
+              model: Doctor,
+              include: [
+                {
+                  model: User,
+                  attributes: ['id'],
+                },
+              ],
+            },
+            {
+              model: Patient,
+              include: [
+                {
+                  model: User,
+                  attributes: ['id'],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    if (!consultation) {
+      res.status(404);
+      throw new Error('Consultation not found');
+    }
+
+    // Verify doctor authorization
+    const doctor = await Doctor.findOne({ where: { userId: req.user.id } });
+    if (!doctor || doctor.id !== consultation.appointment.doctorId) {
+      res.status(403);
+      throw new Error('Not authorized to start this consultation');
+    }
+
+    // Verify consultation can be started
+    if (
+      consultation.status !== ConsultationStatus.SCHEDULED &&
+      consultation.status !== ConsultationStatus.WAITING
+    ) {
+      res.status(400);
+      throw new Error(`Cannot start consultation in ${consultation.status} status`);
+    }
+
+    // In a real application, this would integrate with a video API
+    // For this example, we'll generate mock session data
+    const sessionId = uuidv4();
+    const sessionToken = uuidv4();
+
+    // Update consultation
+    await consultation.update({
+      status: ConsultationStatus.IN_PROGRESS,
+      sessionId,
+      sessionToken,
+      startTime: new Date(),
+    });
+
+    // Update appointment status
+    await consultation.appointment.update({
+      status: AppointmentStatus.IN_PROGRESS,
+      actualStartTime: new Date(),
+    });
+
+    // Notify patient via websocket
+    const io = getIO();
+    io.to(`patient-${consultation.appointment.patientId}`).emit('consultation-started', {
+      id: consultation.id,
+      appointmentId: consultation.appointmentId,
+      sessionId,
+      sessionToken,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Consultation started successfully',
+      data: {
+        id: consultation.id,
+        status: consultation.status,
+        sessionId: consultation.sessionId,
+        sessionToken: consultation.sessionToken,
+        startTime: consultation.startTime,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * End a consultation session
+ * @route PUT /api/v1/consultations/:id/end
+ * @access Private (Doctor)
+ */
+export const endConsultation = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+    const { doctorNotes } = req.body;
+
+    // Find consultation
+    const consultation = await Consultation.findByPk(id, {
+      include: [
+        {
+          model: Appointment,
+        },
+      ],
+    });
+
+    if (!consultation) {
+      res.status(404);
+      throw new Error('Consultation not found');
+    }
+
+    // Verify doctor authorization
+    const doctor = await Doctor.findOne({ where: { userId: req.user.id } });
+    if (!doctor || doctor.id !== consultation.appointment.doctorId) {
+      res.status(403);
+      throw new Error('Not authorized to end this consultation');
+    }
+
+    // Verify consultation is in progress
+    if (consultation.status !== ConsultationStatus.IN_PROGRESS) {
+      res.status(400);
+      throw new Error(`Cannot end consultation in ${consultation.status} status`);
+    }
+
+    // Calculate duration
+    const startTime = consultation.startTime!;
+    const endTime = new Date();
+    const durationMs = endTime.getTime() - startTime.getTime();
+    const durationMinutes = Math.ceil(durationMs / (1000 * 60));
+
+    // Update consultation
+    await consultation.update({
+      status: ConsultationStatus.COMPLETED,
+      endTime,
+      duration: durationMinutes,
+      doctorNotes: doctorNotes || consultation.doctorNotes,
+    });
+
+    // Update appointment status
+    await consultation.appointment.update({
+      status: AppointmentStatus.COMPLETED,
+      actualEndTime: endTime,
+      notes: doctorNotes || consultation.appointment.notes,
+    });
+
+    // Notify patient via websocket
+    const io = getIO();
+    io.to(`patient-${consultation.appointment.patientId}`).emit('consultation-ended', {
+      id: consultation.id,
+      appointmentId: consultation.appointmentId,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Consultation ended successfully',
+      data: {
+        id: consultation.id,
+        status: consultation.status,
+        endTime: consultation.endTime,
+        duration: consultation.duration,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Join a consultation session
+ * @route GET /api/v1/consultations/:id/join
+ * @access Private (Patient, Doctor)
+ */
+export const joinConsultation = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+
+    // Find consultation
+    const consultation = await Consultation.findByPk(id, {
+      include: [
+        {
+          model: Appointment,
+          include: [
+            {
+              model: Doctor,
+              include: [
+                {
+                  model: User,
+                  attributes: ['id', 'firstName', 'lastName', 'profileImage'],
+                },
+              ],
+            },
+            {
+              model: Patient,
+              include: [
+                {
+                  model: User,
+                  attributes: ['id', 'firstName', 'lastName', 'profileImage'],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    if (!consultation) {
+      res.status(404);
+      throw new Error('Consultation not found');
+    }
+
+    // Check authorization
+    let isAuthorized = false;
+
+    if (req.user.role === 'doctor') {
+      const doctor = await Doctor.findOne({ where: { userId: req.user.id } });
+      isAuthorized = doctor?.id === consultation.appointment.doctorId;
+    } else if (req.user.role === 'patient') {
+      const patient = await Patient.findOne({ where: { userId: req.user.id } });
+      isAuthorized = patient?.id === consultation.appointment.patientId;
+    } else if (req.user.role === 'admin') {
+      isAuthorized = true;
+    }
+
+    if (!isAuthorized) {
+      res.status(403);
+      throw new Error('Not authorized to join this consultation');
+    }
+
+    // If patient is joining and consultation is 'scheduled', update to 'waiting'
+    if (req.user.role === 'patient' && consultation.status === ConsultationStatus.SCHEDULED) {
+      await consultation.update({ status: ConsultationStatus.WAITING });
+
+      // Notify doctor
+      const io = getIO();
+      io.to(`doctor-${consultation.appointment.doctorId}`).emit('patient-waiting', {
+        id: consultation.id,
+        appointmentId: consultation.appointmentId,
+        patientName: `${consultation.appointment.patient.user.firstName} ${consultation.appointment.patient.user.lastName}`,
+      });
+    }
+
+    // Return consultation details
+    res.status(200).json({
+      success: true,
+      data: {
+        id: consultation.id,
+        status: consultation.status,
+        sessionId: consultation.sessionId,
+        sessionToken: consultation.sessionToken,
+        startTime: consultation.startTime,
+        appointment: {
+          id: consultation.appointment.id,
+          scheduledStartTime: consultation.appointment.scheduledStartTime,
+          scheduledEndTime: consultation.appointment.scheduledEndTime,
+        },
+        doctor: {
+          id: consultation.appointment.doctor.id,
+          name: `${consultation.appointment.doctor.user.firstName} ${consultation.appointment.doctor.user.lastName}`,
+          profileImage: consultation.appointment.doctor.user.profileImage,
+        },
+        patient: {
+          id: consultation.appointment.patient.id,
+          name: `${consultation.appointment.patient.user.firstName} ${consultation.appointment.patient.user.lastName}`,
+          profileImage: consultation.appointment.patient.user.profileImage,
+        },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get consultation details
+ * @route GET /api/v1/consultations/:id
+ * @access Private (Patient, Doctor)
+ */
+export const getConsultationById = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+
+    // Find consultation
+    const consultation = await Consultation.findByPk(id, {
+      include: [
+        {
+          model: Appointment,
+          include: [
+            {
+              model: Doctor,
+              include: [
+                {
+                  model: User,
+                  attributes: ['firstName', 'lastName', 'profileImage'],
+                },
+              ],
+            },
+            {
+              model: Patient,
+              include: [
+                {
+                  model: User,
+                  attributes: ['firstName', 'lastName', 'profileImage'],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    if (!consultation) {
+      res.status(404);
+      throw new Error('Consultation not found');
+    }
+
+    // Check authorization
+    let isAuthorized = false;
+    let includeNotes = false;
+
+    if (req.user.role === 'doctor') {
+      const doctor = await Doctor.findOne({ where: { userId: req.user.id } });
+      isAuthorized = doctor?.id === consultation.appointment.doctorId;
+      includeNotes = isAuthorized;
+    } else if (req.user.role === 'patient') {
+      const patient = await Patient.findOne({ where: { userId: req.user.id } });
+      isAuthorized = patient?.id === consultation.appointment.patientId;
+    } else if (req.user.role === 'admin') {
+      isAuthorized = true;
+      includeNotes = true;
+    }
+
+    if (!isAuthorized) {
+      res.status(403);
+      throw new Error('Not authorized to view this consultation');
+    }
+
+    // Format response
+    const response = {
+      id: consultation.id,
+      status: consultation.status,
+      appointmentId: consultation.appointmentId,
+      startTime: consultation.startTime,
+      endTime: consultation.endTime,
+      duration: consultation.duration,
+      appointment: {
+        id: consultation.appointment.id,
+        scheduledStartTime: consultation.appointment.scheduledStartTime,
+        scheduledEndTime: consultation.appointment.scheduledEndTime,
+        status: consultation.appointment.status,
+      },
+      doctor: {
+        id: consultation.appointment.doctor.id,
+        name: `${consultation.appointment.doctor.user.firstName} ${consultation.appointment.doctor.user.lastName}`,
+        profileImage: consultation.appointment.doctor.user.profileImage,
+      },
+      patient: {
+        id: consultation.appointment.patient.id,
+        name: `${consultation.appointment.patient.user.firstName} ${consultation.appointment.patient.user.lastName}`,
+        profileImage: consultation.appointment.patient.user.profileImage,
+      },
+    };
+
+    // Include notes if authorized
+    if (includeNotes) {
+      Object.assign(response, {
+        doctorNotes: consultation.doctorNotes,
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: response,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+</file>
+
 <file path="src/api/controllers/doctor.controller.ts">
 // server/src/api/controllers/doctor.controller.ts
 import { Request, Response, NextFunction } from 'express';
@@ -1355,6 +2533,2044 @@ export const updateDoctorProfile = async (
         offersHomeVisit: updatedDoctor.offersHomeVisit,
         offersTeleConsultation: updatedDoctor.offersTeleConsultation,
       },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+</file>
+
+<file path="src/api/controllers/patient.controller.ts">
+// src/api/controllers/patient.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import Patient from '../../database/models/Patient';
+import User from '../../database/models/User';
+import { AuthRequest } from '../../middleware/auth.middleware';
+
+/**
+ * Get patient profile
+ * @route GET /api/v1/patients/profile
+ * @access Private (Patient)
+ */
+export const getPatientProfile = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const patient = await Patient.findOne({
+      where: { userId: req.user.id },
+      include: [
+        {
+          model: User,
+          attributes: ['firstName', 'lastName', 'email', 'phone', 'profileImage']
+        }
+      ]
+    });
+
+    if (!patient) {
+      res.status(404);
+      throw new Error('Patient profile not found');
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        id: patient.id,
+        user: {
+          firstName: patient.user.firstName,
+          lastName: patient.user.lastName,
+          email: patient.user.email,
+          phone: patient.user.phone,
+          profileImage: patient.user.profileImage
+        },
+        dateOfBirth: patient.dateOfBirth,
+        gender: patient.gender,
+        allergies: patient.allergies,
+        chronicDiseases: patient.chronicDiseases,
+        currentMedications: patient.currentMedications,
+        medicalHistory: patient.medicalHistory,
+        emergencyContact: {
+          name: patient.emergencyContactName,
+          phone: patient.emergencyContactPhone,
+          relation: patient.emergencyContactRelation
+        }
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Update patient profile
+ * @route PUT /api/v1/patients/profile
+ * @access Private (Patient)
+ */
+export const updatePatientProfile = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const patient = await Patient.findOne({ where: { userId: req.user.id } });
+    if (!patient) {
+      res.status(404);
+      throw new Error('Patient profile not found');
+    }
+
+    const {
+      dateOfBirth,
+      gender,
+      allergies,
+      chronicDiseases,
+      currentMedications,
+      medicalHistory,
+      emergencyContactName,
+      emergencyContactPhone,
+      emergencyContactRelation
+    } = req.body;
+
+    // Update patient profile
+    const updatedPatient = await patient.update({
+      dateOfBirth: dateOfBirth || patient.dateOfBirth,
+      gender: gender || patient.gender,
+      allergies: allergies || patient.allergies,
+      chronicDiseases: chronicDiseases || patient.chronicDiseases,
+      currentMedications: currentMedications || patient.currentMedications,
+      medicalHistory: medicalHistory || patient.medicalHistory,
+      emergencyContactName: emergencyContactName || patient.emergencyContactName,
+      emergencyContactPhone: emergencyContactPhone || patient.emergencyContactPhone,
+      emergencyContactRelation: emergencyContactRelation || patient.emergencyContactRelation
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Patient profile updated successfully',
+      data: {
+        id: updatedPatient.id,
+        dateOfBirth: updatedPatient.dateOfBirth,
+        gender: updatedPatient.gender,
+        allergies: updatedPatient.allergies,
+        chronicDiseases: updatedPatient.chronicDiseases,
+        currentMedications: updatedPatient.currentMedications,
+        medicalHistory: updatedPatient.medicalHistory,
+        emergencyContact: {
+          name: updatedPatient.emergencyContactName,
+          phone: updatedPatient.emergencyContactPhone,
+          relation: updatedPatient.emergencyContactRelation
+        }
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get patient medical history
+ * @route GET /api/v1/patients/medical-history
+ * @access Private (Patient, Doctor with permission)
+ */
+export const getMedicalHistory = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { patientId } = req.params;
+    let patient;
+
+    if (req.user.role === 'patient') {
+      // Patients can only access their own medical history
+      patient = await Patient.findOne({ where: { userId: req.user.id } });
+    } else if (req.user.role === 'doctor') {
+      // Doctors can access medical history of their patients
+      // This would need a check to verify the doctor has an appointment with this patient
+      patient = await Patient.findByPk(patientId);
+      
+      // Additional authorization check would go here
+      // For example: check if the doctor has an appointment with this patient
+    } else if (req.user.role === 'admin') {
+      patient = await Patient.findByPk(patientId);
+    }
+
+    if (!patient) {
+      res.status(404);
+      throw new Error('Patient not found or access denied');
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        allergies: patient.allergies,
+        chronicDiseases: patient.chronicDiseases,
+        currentMedications: patient.currentMedications,
+        medicalHistory: patient.medicalHistory
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Update medical history
+ * @route PUT /api/v1/patients/medical-history
+ * @access Private (Patient)
+ */
+export const updateMedicalHistory = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const patient = await Patient.findOne({ where: { userId: req.user.id } });
+    if (!patient) {
+      res.status(404);
+      throw new Error('Patient profile not found');
+    }
+
+    const { allergies, chronicDiseases, currentMedications, medicalHistory } = req.body;
+
+    // Update medical history
+    const updatedPatient = await patient.update({
+      allergies: allergies || patient.allergies,
+      chronicDiseases: chronicDiseases || patient.chronicDiseases,
+      currentMedications: currentMedications || patient.currentMedications,
+      medicalHistory: medicalHistory || patient.medicalHistory
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Medical history updated successfully',
+      data: {
+        allergies: updatedPatient.allergies,
+        chronicDiseases: updatedPatient.chronicDiseases,
+        currentMedications: updatedPatient.currentMedications,
+        medicalHistory: updatedPatient.medicalHistory
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+</file>
+
+<file path="src/api/controllers/payment.controller.ts">
+// src/api/controllers/payment.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import Payment, { PaymentStatus, PaymentMethod } from '../../database/models/Payment';
+import Appointment from '../../database/models/Appointment';
+import Doctor from '../../database/models/Doctor';
+import Patient from '../../database/models/Patient';
+import User from '../../database/models/User';
+import { AuthRequest } from '../../middleware/auth.middleware';
+import { PaginatedResponse } from '../../types';
+
+/**
+ * Create a payment
+ * @route POST /api/v1/payments
+ * @access Private
+ */
+export const createPayment = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const {
+      appointmentId,
+      amount,
+      method,
+      transactionId,
+      gatewayResponse
+    } = req.body;
+
+    // Verify appointment exists
+    const appointment = await Appointment.findByPk(appointmentId, {
+      include: [
+        {
+          model: Doctor,
+          attributes: ['id']
+        },
+        {
+          model: Patient,
+          attributes: ['id']
+        }
+      ]
+    });
+
+    if (!appointment) {
+      res.status(404);
+      throw new Error('Appointment not found');
+    }
+
+    // Check if user is authorized (patient, doctor of the appointment, or admin)
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    // For patients, verify they are the appointment owner
+    if (user.role === 'patient') {
+      const patient = await Patient.findOne({ where: { userId: req.user.id } });
+      if (!patient || patient.id !== appointment.patientId) {
+        res.status(403);
+        throw new Error('Unauthorized');
+      }
+    }
+
+    // Check if payment already exists
+    const existingPayment = await Payment.findOne({
+      where: { appointmentId }
+    });
+
+    if (existingPayment) {
+      res.status(400);
+      throw new Error('Payment already exists for this appointment');
+    }
+
+    // Calculate fees
+    const platformFee = (amount * 0.05); // 5% platform fee, adjust as needed
+    const doctorAmount = amount - platformFee;
+
+    // Create payment
+    const payment = await Payment.create({
+      id: uuidv4(),
+      appointmentId,
+      amount,
+      tax: 0, // Adjust for tax calculation if needed
+      platformFee,
+      doctorAmount,
+      status: PaymentStatus.PENDING,
+      method: method || PaymentMethod.CREDIT_CARD,
+      transactionId,
+      gatewayResponse,
+      invoiceNumber: `INV-${Date.now()}-${appointmentId.substring(0, 4)}`
+    });
+
+    // If transaction ID is provided, consider payment as completed
+    if (transactionId) {
+      payment.status = PaymentStatus.COMPLETED;
+      payment.paidAt = new Date();
+      await payment.save();
+
+      // Update appointment payment status
+      await appointment.update({ isPaid: true });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Payment created successfully',
+      data: {
+        id: payment.id,
+        appointmentId: payment.appointmentId,
+        amount: payment.amount,
+        status: payment.status,
+        method: payment.method,
+        invoiceNumber: payment.invoiceNumber,
+        paidAt: payment.paidAt
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Verify payment
+ * @route PUT /api/v1/payments/:id/verify
+ * @access Private
+ */
+export const verifyPayment = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+    const { transactionId, status, gatewayResponse } = req.body;
+
+    // Find payment
+    const payment = await Payment.findByPk(id, {
+      include: [
+        {
+          model: Appointment,
+          attributes: ['id', 'patientId', 'doctorId', 'status']
+        }
+      ]
+    });
+
+    if (!payment) {
+      res.status(404);
+      throw new Error('Payment not found');
+    }
+
+    // Update payment status
+    payment.status = status || PaymentStatus.COMPLETED;
+    payment.transactionId = transactionId || payment.transactionId;
+    payment.gatewayResponse = gatewayResponse || payment.gatewayResponse;
+
+    if (status === PaymentStatus.COMPLETED) {
+      payment.paidAt = new Date();
+      
+      // Update appointment payment status
+      await payment.appointment.update({ isPaid: true });
+    }
+
+    await payment.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Payment verified successfully',
+      data: {
+        id: payment.id,
+        status: payment.status,
+        transactionId: payment.transactionId,
+        paidAt: payment.paidAt
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get payment by ID
+ * @route GET /api/v1/payments/:id
+ * @access Private
+ */
+export const getPaymentById = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+
+    // Find payment
+    const payment = await Payment.findByPk(id, {
+      include: [
+        {
+          model: Appointment,
+          include: [
+            {
+              model: Doctor,
+              include: [
+                {
+                  model: User,
+                  attributes: ['firstName', 'lastName']
+                }
+              ]
+            },
+            {
+              model: Patient,
+              include: [
+                {
+                  model: User,
+                  attributes: ['firstName', 'lastName']
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    });
+
+    if (!payment) {
+      res.status(404);
+      throw new Error('Payment not found');
+    }
+
+    // Check authorization
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    if (user.role === 'patient') {
+      const patient = await Patient.findOne({ where: { userId: req.user.id } });
+      if (!patient || patient.id !== payment.appointment.patientId) {
+        res.status(403);
+        throw new Error('Unauthorized');
+      }
+    } else if (user.role === 'doctor') {
+      const doctor = await Doctor.findOne({ where: { userId: req.user.id } });
+      if (!doctor || doctor.id !== payment.appointment.doctorId) {
+        res.status(403);
+        throw new Error('Unauthorized');
+      }
+    }
+
+    // Format response
+    const formattedPayment = {
+      id: payment.id,
+      appointmentId: payment.appointmentId,
+      amount: payment.amount,
+      tax: payment.tax,
+      platformFee: payment.platformFee,
+      doctorAmount: payment.doctorAmount,
+      status: payment.status,
+      method: payment.method,
+      transactionId: payment.transactionId,
+      invoiceNumber: payment.invoiceNumber,
+      paidAt: payment.paidAt,
+      createdAt: payment.createdAt,
+      appointment: {
+        id: payment.appointment.id,
+        patient: {
+          id: payment.appointment.patient.id,
+          name: `${payment.appointment.patient.user.firstName} ${payment.appointment.patient.user.lastName}`
+        },
+        doctor: {
+          id: payment.appointment.doctor.id,
+          name: `${payment.appointment.doctor.user.firstName} ${payment.appointment.doctor.user.lastName}`
+        }
+      }
+    };
+
+    res.status(200).json({
+      success: true,
+      data: formattedPayment
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get user payments
+ * @route GET /api/v1/payments
+ * @access Private
+ */
+export const getUserPayments = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const offset = (page - 1) * limit;
+    const status = req.query.status as string;
+
+    // Determine if user is patient or doctor
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    let appointmentFilter: any = {};
+
+    if (user.role === 'patient') {
+      const patient = await Patient.findOne({ where: { userId: user.id } });
+      if (!patient) {
+        res.status(404);
+        throw new Error('Patient profile not found');
+      }
+      appointmentFilter = { patientId: patient.id };
+    } else if (user.role === 'doctor') {
+      const doctor = await Doctor.findOne({ where: { userId: user.id } });
+      if (!doctor) {
+        res.status(404);
+        throw new Error('Doctor profile not found');
+      }
+      appointmentFilter = { doctorId: doctor.id };
+    } else if (user.role !== 'admin') {
+      res.status(403);
+      throw new Error('Unauthorized');
+    }
+
+    // Status filter
+    const statusFilter = status ? { status } : {};
+
+    // Get payments
+    const { count, rows } = await Payment.findAndCountAll({
+      include: [
+        {
+          model: Appointment,
+          where: appointmentFilter,
+          include: [
+            {
+              model: Doctor,
+              include: [
+                {
+                  model: User,
+                  attributes: ['firstName', 'lastName']
+                }
+              ]
+            },
+            {
+              model: Patient,
+              include: [
+                {
+                  model: User,
+                  attributes: ['firstName', 'lastName']
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      where: statusFilter,
+      order: [['createdAt', 'DESC']],
+      limit,
+      offset
+    });
+
+    // Format payments
+    const payments = rows.map(payment => ({
+      id: payment.id,
+      amount: payment.amount,
+      status: payment.status,
+      method: payment.method,
+      invoiceNumber: payment.invoiceNumber,
+      paidAt: payment.paidAt,
+      createdAt: payment.createdAt,
+      appointment: {
+        id: payment.appointment.id,
+        patientName: `${payment.appointment.patient.user.firstName} ${payment.appointment.patient.user.lastName}`,
+        doctorName: `${payment.appointment.doctor.user.firstName} ${payment.appointment.doctor.user.lastName}`
+      }
+    }));
+
+    const response: PaginatedResponse<(typeof payments)[0]> = {
+      data: payments,
+      pagination: {
+        page,
+        limit,
+        totalItems: count,
+        totalPages: Math.ceil(count / limit)
+      }
+    };
+
+    res.status(200).json({
+      success: true,
+      ...response
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+</file>
+
+<file path="src/api/controllers/prescription.controller.ts">
+// src/api/controllers/prescription.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import Prescription from '../../database/models/Prescription';
+import PrescriptionMedication from '../../database/models/PrescriptionMedication';
+import Appointment from '../../database/models/Appointment';
+import Doctor from '../../database/models/Doctor';
+import Patient from '../../database/models/Patient';
+import User from '../../database/models/User';
+import { AuthRequest } from '../../middleware/auth.middleware';
+import { PaginatedResponse } from '../../types';
+
+/**
+ * Create a new prescription
+ * @route POST /api/v1/prescriptions
+ * @access Private (Doctor)
+ */
+export const createPrescription = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const {
+      appointmentId,
+      patientId,
+      diagnosis,
+      instructions,
+      notes,
+      validUntil,
+      medications
+    } = req.body;
+
+    // Verify doctor exists
+    const doctor = await Doctor.findOne({ where: { userId: req.user.id } });
+    if (!doctor) {
+      res.status(404);
+      throw new Error('Doctor profile not found');
+    }
+
+    // Verify appointment exists and belongs to this doctor
+    const appointment = await Appointment.findOne({
+      where: { id: appointmentId, doctorId: doctor.id }
+    });
+    if (!appointment) {
+      res.status(404);
+      throw new Error('Appointment not found or does not belong to this doctor');
+    }
+
+    // Verify patient exists
+    const patient = await Patient.findByPk(patientId);
+    if (!patient) {
+      res.status(404);
+      throw new Error('Patient not found');
+    }
+
+    // Create prescription
+    const prescriptionId = uuidv4();
+    const prescription = await Prescription.create({
+      id: prescriptionId,
+      appointmentId,
+      doctorId: doctor.id,
+      patientId,
+      diagnosis,
+      instructions,
+      notes,
+      validUntil,
+      isDigitallySigned: true,
+      digitalSignature: `Dr. ${req.user.email}` // In a real app, this would be more secure
+    });
+
+    // Add medications to prescription
+    if (medications && medications.length > 0) {
+      await Promise.all(
+        medications.map(async (med: any) => {
+          await PrescriptionMedication.create({
+            id: uuidv4(),
+            prescriptionId,
+            name: med.name,
+            dosage: med.dosage,
+            frequency: med.frequency,
+            duration: med.duration,
+            durationUnit: med.durationUnit,
+            isBeforeMeal: med.isBeforeMeal || false,
+            instructions: med.instructions,
+            notes: med.notes
+          });
+        })
+      );
+    }
+
+    // Get the created prescription with medications
+    const prescriptionWithMeds = await Prescription.findByPk(prescriptionId, {
+      include: [PrescriptionMedication]
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Prescription created successfully',
+      data: prescriptionWithMeds
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get prescriptions for a patient
+ * @route GET /api/v1/prescriptions/patient/:patientId
+ * @access Private (Patient, Doctor)
+ */
+export const getPatientPrescriptions = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { patientId } = req.params;
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const offset = (page - 1) * limit;
+
+    // Check authorization
+    if (req.user.role === 'patient') {
+      const patient = await Patient.findOne({ where: { userId: req.user.id } });
+      if (!patient || patient.id !== patientId) {
+        res.status(403);
+        throw new Error('You can only view your own prescriptions');
+      }
+    } else if (req.user.role === 'doctor') {
+      // Doctor should only view prescriptions they wrote or for patients they treat
+      // This would need additional validation in a real app
+    }
+
+    const { count, rows } = await Prescription.findAndCountAll({
+      where: { patientId },
+      include: [
+        {
+          model: PrescriptionMedication,
+        },
+        {
+          model: Doctor,
+          include: [
+            {
+              model: User,
+              attributes: ['firstName', 'lastName']
+            }
+          ]
+        },
+        {
+          model: Appointment,
+          attributes: ['id', 'scheduledStartTime', 'type']
+        }
+      ],
+      order: [['createdAt', 'DESC']],
+      limit,
+      offset
+    });
+
+    // Format prescriptions
+    const prescriptions = rows.map(prescription => ({
+      id: prescription.id,
+      diagnosis: prescription.diagnosis,
+      instructions: prescription.instructions,
+      validUntil: prescription.validUntil,
+      createdAt: prescription.createdAt,
+      doctor: {
+        id: prescription.doctor.id,
+        name: `${prescription.doctor.user.firstName} ${prescription.doctor.user.lastName}`
+      },
+      appointment: {
+        id: prescription.appointment.id,
+        date: prescription.appointment.scheduledStartTime,
+        type: prescription.appointment.type
+      },
+      medications: prescription.medications.map(med => ({
+        name: med.name,
+        dosage: med.dosage,
+        frequency: med.frequency,
+        duration: `${med.duration} ${med.durationUnit}`,
+        isBeforeMeal: med.isBeforeMeal,
+        instructions: med.instructions
+      }))
+    }));
+
+    const response: PaginatedResponse<(typeof prescriptions)[0]> = {
+      data: prescriptions,
+      pagination: {
+        page,
+        limit,
+        totalItems: count,
+        totalPages: Math.ceil(count / limit)
+      }
+    };
+
+    res.status(200).json({
+      success: true,
+      ...response
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get a specific prescription
+ * @route GET /api/v1/prescriptions/:id
+ * @access Private (Patient, Doctor)
+ */
+export const getPrescriptionById = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+
+    const prescription = await Prescription.findByPk(id, {
+      include: [
+        {
+          model: PrescriptionMedication,
+        },
+        {
+          model: Doctor,
+          include: [
+            {
+              model: User,
+              attributes: ['firstName', 'lastName']
+            }
+          ]
+        },
+        {
+          model: Patient,
+          include: [
+            {
+              model: User,
+              attributes: ['firstName', 'lastName']
+            }
+          ]
+        },
+        {
+          model: Appointment,
+          attributes: ['id', 'scheduledStartTime', 'type']
+        }
+      ]
+    });
+
+    if (!prescription) {
+      res.status(404);
+      throw new Error('Prescription not found');
+    }
+
+    // Authorization check
+    if (req.user.role === 'patient') {
+      const patient = await Patient.findOne({ where: { userId: req.user.id } });
+      if (!patient || patient.id !== prescription.patientId) {
+        res.status(403);
+        throw new Error('Unauthorized');
+      }
+    } else if (req.user.role === 'doctor') {
+      const doctor = await Doctor.findOne({ where: { userId: req.user.id } });
+      if (!doctor || doctor.id !== prescription.doctorId) {
+        res.status(403);
+        throw new Error('Unauthorized');
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      data: {
+        id: prescription.id,
+        diagnosis: prescription.diagnosis,
+        instructions: prescription.instructions,
+        notes: prescription.notes,
+        validUntil: prescription.validUntil,
+        isDigitallySigned: prescription.isDigitallySigned,
+        createdAt: prescription.createdAt,
+        doctor: {
+          id: prescription.doctor.id,
+          name: `${prescription.doctor.user.firstName} ${prescription.doctor.user.lastName}`
+        },
+        patient: {
+          id: prescription.patient.id,
+          name: `${prescription.patient.user.firstName} ${prescription.patient.user.lastName}`
+        },
+        appointment: {
+          id: prescription.appointment.id,
+          date: prescription.appointment.scheduledStartTime,
+          type: prescription.appointment.type
+        },
+        medications: prescription.medications.map(med => ({
+          id: med.id,
+          name: med.name,
+          dosage: med.dosage,
+          frequency: med.frequency,
+          duration: med.duration,
+          durationUnit: med.durationUnit,
+          isBeforeMeal: med.isBeforeMeal,
+          instructions: med.instructions,
+          notes: med.notes
+        }))
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+</file>
+
+<file path="src/api/controllers/rating.controller.ts">
+// src/api/controllers/rating.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import Rating from '../../database/models/Rating';
+import Appointment from '../../database/models/Appointment';
+import Doctor from '../../database/models/Doctor';
+import Patient from '../../database/models/Patient';
+import Clinic from '../../database/models/Clinic';
+import User from '../../database/models/User';
+import { AuthRequest } from '../../middleware/auth.middleware';
+import { PaginatedResponse } from '../../types';
+import { sequelize } from '../../database';
+import { Op } from 'sequelize';
+
+/**
+ * Create a rating
+ * @route POST /api/v1/ratings
+ * @access Private (Patient)
+ */
+export const createRating = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { appointmentId, doctorRating, clinicRating, review, isAnonymous } = req.body;
+
+    // Verify patient
+    const patient = await Patient.findOne({ where: { userId: req.user.id } });
+    if (!patient) {
+      res.status(404);
+      throw new Error('Patient profile not found');
+    }
+
+    // Verify appointment exists and belongs to this patient
+    const appointment = await Appointment.findOne({
+      where: { id: appointmentId, patientId: patient.id },
+      include: [
+        {
+          model: Doctor,
+        },
+        {
+          model: Clinic,
+        },
+      ],
+    });
+
+    if (!appointment) {
+      res.status(404);
+      throw new Error('Appointment not found or does not belong to this patient');
+    }
+
+    // Verify appointment is completed
+    if (appointment.status !== 'completed') {
+      res.status(400);
+      throw new Error('Cannot rate an appointment that is not completed');
+    }
+
+    // Check if rating already exists
+    const existingRating = await Rating.findOne({
+      where: { appointmentId },
+    });
+
+    if (existingRating) {
+      res.status(400);
+      throw new Error('Rating already exists for this appointment');
+    }
+
+    // Start transaction
+    const transaction = await sequelize.transaction();
+
+    try {
+      // Create rating
+      const rating = await Rating.create(
+        {
+          id: uuidv4(),
+          appointmentId,
+          doctorId: appointment.doctorId,
+          patientId: patient.id,
+          clinicId: appointment.clinicId,
+          doctorRating,
+          clinicRating: appointment.clinicId ? clinicRating : null,
+          review,
+          isAnonymous: isAnonymous || false,
+          isVerified: true, // Auto-verify since it's from a completed appointment
+          isPublished: true, // Auto-publish
+        },
+        { transaction }
+      );
+
+      // Update doctor's average rating
+      if (doctorRating) {
+        const doctor = appointment.doctor;
+        const doctorRatings = await Rating.findAll({
+          where: { doctorId: doctor.id },
+          attributes: ['doctorRating'],
+        });
+
+        const totalRating = doctorRatings.reduce((sum, r) => sum + r.doctorRating, 0);
+        const averageRating = totalRating / doctorRatings.length;
+        const totalRatings = doctorRatings.length;
+
+        await doctor.update(
+          {
+            averageRating,
+            totalRatings,
+          },
+          { transaction }
+        );
+      }
+      // src/api/controllers/rating.controller.ts (continued)
+      // Update clinic's average rating if applicable
+      if (clinicRating && appointment.clinicId) {
+        const clinic = appointment.clinic;
+        const clinicRatings = await Rating.findAll({
+          where: { clinicId: clinic!.id, clinicRating: { [Op.ne]: null } },
+          attributes: ['clinicRating'],
+        });
+
+        const totalRating = clinicRatings.reduce((sum, r) => sum + (r.clinicRating || 0), 0);
+        const averageRating = totalRating / clinicRatings.length;
+        const totalRatings = clinicRatings.length;
+
+        await clinic!.update(
+          {
+            averageRating,
+            totalRatings,
+          },
+          { transaction }
+        );
+      }
+
+      await transaction.commit();
+
+      res.status(201).json({
+        success: true,
+        message: 'Rating submitted successfully',
+        data: {
+          id: rating.id,
+          doctorRating: rating.doctorRating,
+          clinicRating: rating.clinicRating,
+          review: rating.review,
+          isAnonymous: rating.isAnonymous,
+          createdAt: rating.createdAt,
+        },
+      });
+    } catch (error) {
+      await transaction.rollback();
+      throw error;
+    }
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get ratings for a doctor
+ * @route GET /api/v1/ratings/doctor/:doctorId
+ * @access Public
+ */
+export const getDoctorRatings = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { doctorId } = req.params;
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const offset = (page - 1) * limit;
+
+    // Get doctor
+    const doctor = await Doctor.findByPk(doctorId, {
+      include: [
+        {
+          model: User,
+          attributes: ['firstName', 'lastName'],
+        },
+      ],
+    });
+
+    if (!doctor) {
+      res.status(404);
+      throw new Error('Doctor not found');
+    }
+
+    // Get ratings
+    const { count, rows } = await Rating.findAndCountAll({
+      where: {
+        doctorId,
+        isPublished: true,
+      },
+      include: [
+        {
+          model: Patient,
+          include: [
+            {
+              model: User,
+              attributes: ['firstName', 'lastName'],
+            },
+          ],
+        },
+      ],
+      order: [['createdAt', 'DESC']],
+      limit,
+      offset,
+    });
+
+    // Format ratings
+    const ratings = rows.map(rating => ({
+      id: rating.id,
+      rating: rating.doctorRating,
+      review: rating.review,
+      patientName: rating.isAnonymous
+        ? 'Anonymous'
+        : `${rating.patient.user.firstName} ${rating.patient.user.lastName}`,
+      createdAt: rating.createdAt,
+    }));
+
+    const response: PaginatedResponse<(typeof ratings)[0]> = {
+      data: ratings,
+      pagination: {
+        page,
+        limit,
+        totalItems: count,
+        totalPages: Math.ceil(count / limit),
+      },
+    };
+
+    res.status(200).json({
+      success: true,
+      doctor: {
+        id: doctor.id,
+        name: `${doctor.user.firstName} ${doctor.user.lastName}`,
+        averageRating: doctor.averageRating,
+        totalRatings: doctor.totalRatings,
+      },
+      ...response,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get ratings for a clinic
+ * @route GET /api/v1/ratings/clinic/:clinicId
+ * @access Public
+ */
+export const getClinicRatings = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { clinicId } = req.params;
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 10;
+    const offset = (page - 1) * limit;
+
+    // Get clinic
+    const clinic = await Clinic.findByPk(clinicId);
+
+    if (!clinic) {
+      res.status(404);
+      throw new Error('Clinic not found');
+    }
+
+    // Get ratings
+    const { count, rows } = await Rating.findAndCountAll({
+      where: {
+        clinicId,
+        clinicRating: { [Op.ne]: null },
+        isPublished: true,
+      },
+      include: [
+        {
+          model: Patient,
+          include: [
+            {
+              model: User,
+              attributes: ['firstName', 'lastName'],
+            },
+          ],
+        },
+      ],
+      order: [['createdAt', 'DESC']],
+      limit,
+      offset,
+    });
+
+    // Format ratings
+    const ratings = rows.map(rating => ({
+      id: rating.id,
+      rating: rating.clinicRating,
+      review: rating.review,
+      patientName: rating.isAnonymous
+        ? 'Anonymous'
+        : `${rating.patient.user.firstName} ${rating.patient.user.lastName}`,
+      createdAt: rating.createdAt,
+    }));
+
+    const response: PaginatedResponse<(typeof ratings)[0]> = {
+      data: ratings,
+      pagination: {
+        page,
+        limit,
+        totalItems: count,
+        totalPages: Math.ceil(count / limit),
+      },
+    };
+
+    res.status(200).json({
+      success: true,
+      clinic: {
+        id: clinic.id,
+        name: clinic.name,
+        averageRating: clinic.averageRating,
+        totalRatings: clinic.totalRatings,
+      },
+      ...response,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Manage rating (admin)
+ * @route PUT /api/v1/ratings/:id
+ * @access Private (Admin)
+ */
+export const manageRating = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+    const { isPublished } = req.body;
+
+    if (isPublished === undefined) {
+      res.status(400);
+      throw new Error('isPublished is required');
+    }
+
+    // Find rating
+    const rating = await Rating.findByPk(id);
+
+    if (!rating) {
+      res.status(404);
+      throw new Error('Rating not found');
+    }
+
+    // Update publication status
+    await rating.update({ isPublished });
+
+    // If unpublishing, recalculate averages
+    if (!isPublished) {
+      // Recalculate doctor average
+      const doctorRatings = await Rating.findAll({
+        where: {
+          doctorId: rating.doctorId,
+          isPublished: true,
+        },
+        attributes: ['doctorRating'],
+      });
+
+      const doctor = await Doctor.findByPk(rating.doctorId);
+      if (doctor) {
+        if (doctorRatings.length > 0) {
+          const totalRating = doctorRatings.reduce((sum, r) => sum + r.doctorRating, 0);
+          const averageRating = totalRating / doctorRatings.length;
+          await doctor.update({
+            averageRating,
+            totalRatings: doctorRatings.length,
+          });
+        } else {
+          await doctor.update({
+            averageRating: null,
+            totalRatings: 0,
+          });
+        }
+      }
+
+      // Recalculate clinic average if applicable
+      if (rating.clinicId) {
+        const clinicRatings = await Rating.findAll({
+          where: {
+            clinicId: rating.clinicId,
+            clinicRating: { [Op.ne]: null },
+            isPublished: true,
+          },
+          attributes: ['clinicRating'],
+        });
+
+        const clinic = await Clinic.findByPk(rating.clinicId);
+        if (clinic) {
+          if (clinicRatings.length > 0) {
+            const totalRating = clinicRatings.reduce((sum, r) => sum + (r.clinicRating || 0), 0);
+            const averageRating = totalRating / clinicRatings.length;
+            await clinic.update({
+              averageRating,
+              totalRatings: clinicRatings.length,
+            });
+          } else {
+            await clinic.update({
+              averageRating: null,
+              totalRatings: 0,
+            });
+          }
+        }
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Rating ${isPublished ? 'published' : 'unpublished'} successfully`,
+      data: {
+        id: rating.id,
+        isPublished: rating.isPublished,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+</file>
+
+<file path="src/api/controllers/schedule.controller.ts">
+// src/api/controllers/schedule.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import { Op } from 'sequelize';
+import Doctor from '../../database/models/Doctor';
+import DoctorClinic from '../../database/models/DoctorClinic';
+import DoctorClinicSchedule from '../../database/models/DoctorClinicSchedule';
+import Clinic from '../../database/models/Clinic';
+import Appointment from '../../database/models/Appointment';
+import { AuthRequest } from '../../middleware/auth.middleware';
+
+/**
+ * Get doctor availability
+ * @route GET /api/v1/schedules/doctors/:doctorId/availability
+ * @access Public
+ */
+export const getDoctorAvailability = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { doctorId } = req.params;
+    const startDate = req.query.startDate as string;
+    const endDate = req.query.endDate as string;
+    const clinicId = req.query.clinicId as string;
+
+    if (!startDate || !endDate) {
+      res.status(400);
+      throw new Error('Start date and end date are required');
+    }
+
+    // Get doctor schedules
+    const doctor = await Doctor.findByPk(doctorId);
+    if (!doctor) {
+      res.status(404);
+      throw new Error('Doctor not found');
+    }
+
+    // Get doctor's clinic schedules
+    let doctorClinics;
+    if (clinicId) {
+      // Get schedule for specific clinic
+      doctorClinics = await DoctorClinic.findAll({
+        where: { doctorId, clinicId, isActive: true },
+        include: [
+          {
+            model: DoctorClinicSchedule,
+            where: { isActive: true }
+          },
+          {
+            model: Clinic,
+            attributes: ['id', 'name', 'address']
+          }
+        ]
+      });
+    } else {
+      // Get schedules for all clinics
+      doctorClinics = await DoctorClinic.findAll({
+        where: { doctorId, isActive: true },
+        include: [
+          {
+            model: DoctorClinicSchedule,
+            where: { isActive: true }
+          },
+          {
+            model: Clinic,
+            attributes: ['id', 'name', 'address']
+          }
+        ]
+      });
+    }
+
+    // Get existing appointments within date range
+    const appointments = await Appointment.findAll({
+      where: {
+        doctorId,
+        scheduledStartTime: {
+          [Op.between]: [new Date(startDate), new Date(endDate)]
+        },
+        status: {
+          [Op.notIn]: ['cancelled', 'no_show']
+        }
+      },
+      attributes: ['scheduledStartTime', 'scheduledEndTime', 'status', 'type']
+    });
+
+    // Calculate available slots based on schedule and existing appointments
+    const availableSlots: Array<{
+      clinicId: string;
+      clinicName: string;
+      date: string;
+      slots: Array<{
+        startTime: string;
+        endTime: string;
+      }>;
+    }> = [];
+
+    // Process each clinic schedule
+    for (const doctorClinic of doctorClinics) {
+      const schedules = doctorClinic.schedules;
+      const slotDuration = doctorClinic.consultationDuration; // minutes
+      
+      // Generate dates within the range
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+      const dateRange: string[] = [];
+      
+      for (let d = start; d <= end; d.setDate(d.getDate() + 1)) {
+        dateRange.push(new Date(d).toISOString().split('T')[0]);
+      }
+
+      // Process each date in the range
+      for (const date of dateRange) {
+        const dayOfWeek = new Date(date).getDay(); // 0 = Sunday, 1 = Monday, ...
+        
+        // Find schedule for this day of week
+        const daySchedule = schedules.find(s => s.dayOfWeek === dayOfWeek);
+        if (!daySchedule) continue;
+
+        // Parse schedule times
+        const startTime = daySchedule.startTime;
+        const endTime = daySchedule.endTime;
+        
+        // Generate time slots for this day
+        const dateSlots: Array<{ startTime: string; endTime: string }> = [];
+        
+        let currentTime = new Date(`${date}T${startTime}`);
+        const scheduledEnd = new Date(`${date}T${endTime}`);
+        
+        while (currentTime < scheduledEnd) {
+          const slotStart = new Date(currentTime);
+          const slotEnd = new Date(currentTime.getTime() + slotDuration * 60000);
+          
+          if (slotEnd <= scheduledEnd) {
+            // Check if this slot overlaps with any appointment
+            const isSlotAvailable = !appointments.some(appointment => {
+              const apptStart = new Date(appointment.scheduledStartTime);
+              const apptEnd = new Date(appointment.scheduledEndTime);
+              
+              return (
+                (slotStart >= apptStart && slotStart < apptEnd) ||
+                (slotEnd > apptStart && slotEnd <= apptEnd) ||
+                (slotStart <= apptStart && slotEnd >= apptEnd)
+              );
+            });
+            
+            if (isSlotAvailable) {
+              dateSlots.push({
+                startTime: slotStart.toISOString(),
+                endTime: slotEnd.toISOString()
+              });
+            }
+          }
+          
+          // Move to next slot
+          currentTime = slotEnd;
+        }
+        
+        // Add slots for this date if any are available
+        if (dateSlots.length > 0) {
+          availableSlots.push({
+            clinicId: doctorClinic.clinicId,
+            clinicName: doctorClinic.clinic.name,
+            date,
+            slots: dateSlots
+          });
+        }
+      }
+    }
+
+    // If doctor offers teleconsultation or home visits, add those slots too
+    if (doctor.offersTeleConsultation || doctor.offersHomeVisit) {
+      // Implementation for virtual visits would go here
+      // This would be similar to clinic visits but with different rules
+    }
+
+    res.status(200).json({
+      success: true,
+      data: availableSlots
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Set doctor schedule
+ * @route POST /api/v1/schedules/doctors/clinic
+ * @access Private (Doctor)
+ */
+export const setDoctorClinicSchedule = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const {
+      clinicId,
+      schedules,
+      consultationFee,
+      consultationDuration
+    } = req.body;
+
+    // Get doctor
+    const doctor = await Doctor.findOne({ where: { userId: req.user.id } });
+    if (!doctor) {
+      res.status(404);
+      throw new Error('Doctor profile not found');
+    }
+
+    // Verify clinic exists
+    const clinic = await Clinic.findByPk(clinicId);
+    if (!clinic) {
+      res.status(404);
+      throw new Error('Clinic not found');
+    }
+
+    // Check if doctor is already associated with this clinic
+    let doctorClinic = await DoctorClinic.findOne({
+      where: { doctorId: doctor.id, clinicId }
+    });
+
+    if (!doctorClinic) {
+      // Create new doctor-clinic association
+      doctorClinic = await DoctorClinic.create({
+        id: uuidv4(),
+        doctorId: doctor.id,
+        clinicId,
+        consultationFee,
+        consultationDuration,
+        isActive: true
+      });
+    } else {
+      // Update existing association
+      await doctorClinic.update({
+        consultationFee: consultationFee || doctorClinic.consultationFee,
+        consultationDuration: consultationDuration || doctorClinic.consultationDuration,
+        isActive: true
+      });
+    }
+
+    // Delete existing schedules for this doctor-clinic combination
+    await DoctorClinicSchedule.destroy({
+      where: { doctorClinicId: doctorClinic.id }
+    });
+
+    // Create new schedules
+    if (schedules && schedules.length > 0) {
+      await Promise.all(
+        schedules.map(async (schedule: any) => {
+          await DoctorClinicSchedule.create({
+            id: uuidv4(),
+            doctorClinicId: doctorClinic!.id,
+            dayOfWeek: schedule.dayOfWeek,
+            startTime: schedule.startTime,
+            endTime: schedule.endTime,
+            slotDuration: schedule.slotDuration || consultationDuration,
+            maxPatients: schedule.maxPatients,
+            isActive: true
+          });
+        })
+      );
+    }
+
+    // Get updated schedules
+    const updatedSchedules = await DoctorClinicSchedule.findAll({
+      where: { doctorClinicId: doctorClinic.id }
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Doctor clinic schedule set successfully',
+      data: {
+        doctorClinic: {
+          id: doctorClinic.id,
+          clinicId,
+          consultationFee: doctorClinic.consultationFee,
+          consultationDuration: doctorClinic.consultationDuration
+        },
+        schedules: updatedSchedules
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Check for scheduling conflicts
+ * @route POST /api/v1/schedules/check-conflicts
+ * @access Private
+ */
+export const checkSchedulingConflicts = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const {
+      doctorId,
+      startTime,
+      endTime
+    } = req.body;
+
+    // Check for overlapping appointments
+    const conflictingAppointments = await Appointment.findAll({
+      where: {
+        doctorId,
+        [Op.or]: [
+          {
+            scheduledStartTime: {
+              [Op.lt]: new Date(endTime),
+            },
+            scheduledEndTime: {
+              [Op.gt]: new Date(startTime),
+            },
+          },
+        ],
+        status: {
+          [Op.notIn]: ['cancelled', 'no_show', 'completed']
+        }
+      }
+    });
+
+    res.status(200).json({
+      success: true,
+      hasConflicts: conflictingAppointments.length > 0,
+      conflicts: conflictingAppointments.map(appt => ({
+        id: appt.id,
+        startTime: appt.scheduledStartTime,
+        endTime: appt.scheduledEndTime,
+        status: appt.status
+      }))
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+</file>
+
+<file path="src/api/controllers/user.controller.ts">
+// src/api/controllers/user.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import User from '../../database/models/User';
+import { AuthRequest } from '../../middleware/auth.middleware';
+
+/**
+ * Get user profile
+ * @route GET /api/v1/users/profile
+ * @access Private
+ */
+export const getUserProfile = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const user = await User.findByPk(req.user.id, {
+      attributes: { exclude: ['password', 'refreshToken'] },
+    });
+
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    res.status(200).json({
+      success: true,
+      data: user,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Update user profile
+ * @route PUT /api/v1/users/profile
+ * @access Private
+ */
+export const updateUserProfile = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { firstName, lastName, phone, address, profileImage } = req.body;
+
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    // Update user
+    const updatedUser = await user.update({
+      firstName: firstName || user.firstName,
+      lastName: lastName || user.lastName,
+      phone: phone || user.phone,
+      address: address || user.address,
+      profileImage: profileImage || user.profileImage,
+    });
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile updated successfully',
+      data: {
+        id: updatedUser.id,
+        firstName: updatedUser.firstName,
+        lastName: updatedUser.lastName,
+        email: updatedUser.email,
+        phone: updatedUser.phone,
+        role: updatedUser.role,
+        profileImage: updatedUser.profileImage,
+        address: updatedUser.address,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Change password
+ * @route PUT /api/v1/users/change-password
+ * @access Private
+ */
+export const changePassword = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      res.status(400);
+      throw new Error('Current password and new password are required');
+    }
+
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    // Verify current password
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+      res.status(401);
+      throw new Error('Current password is incorrect');
+    }
+
+    // Update password
+    user.password = newPassword;
+    await user.save();
+
+    res.status(200).json({
+      success: true,
+      message: 'Password changed successfully',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Upload profile image
+ * @route POST /api/v1/users/profile-image
+ * @access Private
+ */
+export const uploadProfileImage = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    // In a real app, this would handle file upload
+    // For this example, we'll assume the image URL is passed in the request body
+    const { imageUrl } = req.body;
+
+    if (!imageUrl) {
+      res.status(400);
+      throw new Error('Image URL is required');
+    }
+
+    const user = await User.findByPk(req.user.id);
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    // Update profile image
+    await user.update({ profileImage: imageUrl });
+
+    res.status(200).json({
+      success: true,
+      message: 'Profile image updated successfully',
+      data: {
+        profileImage: user.profileImage,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Verify email
+ * @route GET /api/v1/users/verify-email/:token
+ * @access Public
+ */
+export const verifyEmail = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    const { token } = req.params;
+
+    // In a real app, you would verify the token
+    // For this example, we'll just set a dummy user as verified
+
+    // Mock implementation - in real app, decode token to get userId
+    const dummyUserId = token.substring(0, 10);
+
+    const user = await User.findByPk(dummyUserId);
+    if (!user) {
+      res.status(400);
+      throw new Error('Invalid or expired verification token');
+    }
+
+    // Update email verification status
+    await user.update({ isEmailVerified: true });
+
+    res.status(200).json({
+      success: true,
+      message: 'Email verified successfully',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * Get user by ID (admin only)
+ * @route GET /api/v1/users/:id
+ * @access Private (Admin)
+ */
+export const getUserById = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      res.status(401);
+      throw new Error('Not authorized');
+    }
+
+    const { id } = req.params;
+
+    const user = await User.findByPk(id, {
+      attributes: { exclude: ['password', 'refreshToken'] },
+    });
+
+    if (!user) {
+      res.status(404);
+      throw new Error('User not found');
+    }
+
+    res.status(200).json({
+      success: true,
+      data: user,
     });
   } catch (error) {
     next(error);
@@ -2827,8 +6043,83 @@ export const errorHandler = (
 };
 </file>
 
+<file path="src/routes/admin.routes.ts">
+// src/routes/admin.routes.ts
+import { Router } from 'express';
+import { protect, authorize } from '../middleware/auth.middleware';
+import {
+  getDashboardStats,
+  getPendingDoctors,
+  updateDoctorStatus,
+  getUsers,
+  updateUserStatus,
+} from '../api/controllers/admin.controller';
+import { UserRole } from '../database/models/User';
+
+const router: Router = Router();
+
+router.get('/dashboard', protect, authorize(UserRole.ADMIN), getDashboardStats);
+router.get('/doctors/pending', protect, authorize(UserRole.ADMIN), getPendingDoctors);
+router.put('/doctors/:id/status', protect, authorize(UserRole.ADMIN), updateDoctorStatus);
+router.get('/users', protect, authorize(UserRole.ADMIN), getUsers);
+router.put('/users/:id/status', protect, authorize(UserRole.ADMIN), updateUserStatus);
+
+export default router;
+</file>
+
+<file path="src/routes/clinic.routes.ts">
+// src/routes/clinic.routes.ts
+import { Router } from 'express';
+import { protect, authorize } from '../middleware/auth.middleware';
+import {
+  getClinics,
+  getClinicById,
+  createClinic,
+  updateClinic,
+  verifyClinic,
+} from '../api/controllers/clinic.controller';
+import { UserRole } from '../database/models/User';
+
+const router: Router = Router();
+
+router.get('/', getClinics);
+router.get('/:id', getClinicById);
+router.post('/', protect, authorize(UserRole.ADMIN, UserRole.CLINIC_ADMIN), createClinic);
+router.put('/:id', protect, authorize(UserRole.ADMIN, UserRole.CLINIC_ADMIN), updateClinic);
+router.put('/:id/verify', protect, authorize(UserRole.ADMIN), verifyClinic);
+
+export default router;
+</file>
+
+<file path="src/routes/consultation.routes.ts">
+// src/routes/consultation.routes.ts
+import { Router } from 'express';
+import { protect, authorize } from '../middleware/auth.middleware';
+import {
+  startConsultation,
+  endConsultation,
+  joinConsultation,
+  getConsultationById,
+} from '../api/controllers/consultation.controller';
+import { UserRole } from '../database/models/User';
+
+const router: Router = Router();
+
+router.post('/:id/start', protect, authorize(UserRole.DOCTOR), startConsultation);
+router.put('/:id/end', protect, authorize(UserRole.DOCTOR), endConsultation);
+router.get('/:id/join', protect, authorize(UserRole.DOCTOR, UserRole.PATIENT), joinConsultation);
+router.get(
+  '/:id',
+  protect,
+  authorize(UserRole.DOCTOR, UserRole.PATIENT, UserRole.ADMIN),
+  getConsultationById
+);
+
+export default router;
+</file>
+
 <file path="src/routes/index.ts">
-// server/src/routes/index.ts
+// src/routes/index.ts
 import { Router } from 'express';
 import authRoutes from './auth.routes';
 import userRoutes from './user.routes';
@@ -2836,8 +6127,14 @@ import doctorRoutes from './doctor.routes';
 import clinicRoutes from './clinic.routes';
 import appointmentRoutes from './appointment.routes';
 import consultationRoutes from './consultation.routes';
+import patientRoutes from './patient.routes';
+import prescriptionRoutes from './prescription.routes';
+import scheduleRoutes from './schedule.routes';
+import paymentRoutes from './payment.routes';
+import adminRoutes from './admin.routes';
+import ratingRoutes from './rating.routes';
 
-const router = Router();
+const router: Router = Router();
 
 // Health check endpoint
 router.get('/health', (req, res) => {
@@ -2851,6 +6148,165 @@ router.use('/doctors', doctorRoutes);
 router.use('/clinics', clinicRoutes);
 router.use('/appointments', appointmentRoutes);
 router.use('/consultations', consultationRoutes);
+router.use('/patients', patientRoutes);
+router.use('/prescriptions', prescriptionRoutes);
+router.use('/schedules', scheduleRoutes);
+router.use('/payments', paymentRoutes);
+router.use('/admin', adminRoutes);
+router.use('/ratings', ratingRoutes);
+
+export default router;
+</file>
+
+<file path="src/routes/patient.routes.ts">
+// src/routes/patient.routes.ts
+import { Router } from 'express';
+import { protect, authorize } from '../middleware/auth.middleware';
+import {
+  getPatientProfile,
+  updatePatientProfile,
+  getMedicalHistory,
+  updateMedicalHistory,
+} from '../api/controllers/patient.controller';
+import { UserRole } from '../database/models/User';
+
+const router: Router = Router();
+
+router.get('/profile', protect, authorize(UserRole.PATIENT), getPatientProfile);
+router.put('/profile', protect, authorize(UserRole.PATIENT), updatePatientProfile);
+router.get('/medical-history', protect, authorize(UserRole.PATIENT), getMedicalHistory);
+router.put('/medical-history', protect, authorize(UserRole.PATIENT), updateMedicalHistory);
+router.get(
+  '/:patientId/medical-history',
+  protect,
+  authorize(UserRole.DOCTOR, UserRole.ADMIN),
+  getMedicalHistory
+);
+
+export default router;
+</file>
+
+<file path="src/routes/payment.routes.ts">
+// src/routes/payment.routes.ts
+import { Router } from 'express';
+import { protect, authorize } from '../middleware/auth.middleware';
+import {
+  createPayment,
+  verifyPayment,
+  getPaymentById,
+  getUserPayments,
+} from '../api/controllers/payment.controller';
+import { UserRole } from '../database/models/User';
+
+const router: Router = Router();
+
+router.post('/', protect, createPayment);
+router.put('/:id/verify', protect, authorize(UserRole.ADMIN, UserRole.PATIENT), verifyPayment);
+router.get('/:id', protect, getPaymentById);
+router.get('/', protect, getUserPayments);
+
+export default router;
+</file>
+
+<file path="src/routes/prescription.routes.ts">
+// src/routes/prescription.routes.ts
+import { Router } from 'express';
+import { protect, authorize } from '../middleware/auth.middleware';
+import {
+  createPrescription,
+  getPatientPrescriptions,
+  getPrescriptionById,
+} from '../api/controllers/prescription.controller';
+import { UserRole } from '../database/models/User';
+
+const router: Router = Router();
+
+router.post('/', protect, authorize(UserRole.DOCTOR), createPrescription);
+router.get(
+  '/patient/:patientId',
+  protect,
+  authorize(UserRole.PATIENT, UserRole.DOCTOR, UserRole.ADMIN),
+  getPatientPrescriptions
+);
+router.get(
+  '/:id',
+  protect,
+  authorize(UserRole.PATIENT, UserRole.DOCTOR, UserRole.ADMIN),
+  getPrescriptionById
+);
+
+export default router;
+</file>
+
+<file path="src/routes/rating.routes.ts">
+// src/routes/rating.routes.ts
+import { Router } from 'express';
+import { protect, authorize } from '../middleware/auth.middleware';
+import {
+  createRating,
+  getDoctorRatings,
+  getClinicRatings,
+  manageRating,
+} from '../api/controllers/rating.controller';
+import { UserRole } from '../database/models/User';
+
+const router: Router = Router();
+
+router.post('/', protect, authorize(UserRole.PATIENT), createRating);
+router.get('/doctor/:doctorId', getDoctorRatings);
+router.get('/clinic/:clinicId', getClinicRatings);
+router.put('/:id', protect, authorize(UserRole.ADMIN), manageRating);
+
+export default router;
+</file>
+
+<file path="src/routes/schedule.routes.ts">
+// src/routes/schedule.routes.ts
+import { Router } from 'express';
+import { protect, authorize } from '../middleware/auth.middleware';
+import {
+  getDoctorAvailability,
+  setDoctorClinicSchedule,
+  checkSchedulingConflicts,
+} from '../api/controllers/schedule.controller';
+import { UserRole } from '../database/models/User';
+
+const router: Router = Router();
+
+router.get('/doctors/:doctorId/availability', getDoctorAvailability);
+router.post('/doctors/clinic', protect, authorize(UserRole.DOCTOR), setDoctorClinicSchedule);
+router.post('/check-conflicts', protect, checkSchedulingConflicts);
+
+export default router;
+</file>
+
+<file path="src/routes/user.routes.ts">
+// src/routes/user.routes.ts
+import { Router } from 'express';
+import { protect, authorize } from '../middleware/auth.middleware';
+import {
+  getUserProfile,
+  updateUserProfile,
+  changePassword,
+  uploadProfileImage,
+  verifyEmail,
+  getUserById,
+} from '../api/controllers/user.controller';
+import { UserRole } from '../database/models/User';
+
+const router: Router = Router();
+
+// Public routes
+router.get('/verify-email/:token', verifyEmail);
+
+// Protected routes
+router.get('/profile', protect, getUserProfile);
+router.put('/profile', protect, updateUserProfile);
+router.put('/change-password', protect, changePassword);
+router.post('/profile-image', protect, uploadProfileImage);
+
+// Admin routes
+router.get('/:id', protect, authorize(UserRole.ADMIN), getUserById);
 
 export default router;
 </file>
@@ -3173,6 +6629,7 @@ export default config;
     "sequelize": "^6.31.1",
     "sequelize-typescript": "^2.1.5",
     "socket.io": "^4.6.1",
+    "uuid": "^11.1.0",
     "winston": "^3.8.2",
     "zod": "^3.21.4"
   },
